@@ -1,17 +1,16 @@
 //! Copyright (c) M5Stack. All rights reserved.
 //! Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+#pragma once
+
 namespace cpu_clock
 {
   enum cpu_clock_t
-  { clock_8MHz
-  , clock_10MHz
-  , clock_20MHz
-  , clock_40MHz
-  , clock_80MHz
-  , clock_160MHz
-  , clock_240MHz
-  , clock_MAX
+  {
+    clock_40MHz,
+    clock_80MHz,
+    clock_160MHz,
+    clock_MAX,
   };
 
   void init(void);

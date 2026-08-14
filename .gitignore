@@ -1,0 +1,6 @@
+.pio/
+tools/__pycache__/
+tmp/
+p4hub/
+**/src/idf_component.yml
+**/src/idf_component.yml.orig

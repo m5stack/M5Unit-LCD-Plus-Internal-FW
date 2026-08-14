@@ -1,197 +1,291 @@
 //! Copyright (c) M5Stack. All rights reserved.
 //! Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-#include <driver/i2c.h>
-#include <driver/rtc_io.h>
-//#include <driver/timer.h>
-#include <driver/periph_ctrl.h>
-#include <soc/i2c_reg.h>
-#include <soc/i2c_struct.h>
-#include <soc/rtc.h>
+#include <algorithm>
+#include <cstdint>
+
+#include <driver/gpio.h>
+#include <esp_intr_alloc.h>
+#include <esp_rom_gpio.h>
 #include <freertos/FreeRTOS.h>
-#include <esp_log.h>
+#include <freertos/task.h>
+#include <hal/i2c_hal.h>
+#include <hal/i2c_ll.h>
+#include <soc/i2c_periph.h>
 
 #include "command_processor.hpp"
 #include "i2c_slave.hpp"
 
 namespace i2c_slave
 {
-  static constexpr std::size_t soc_i2c_fifo_len = 32;
-  static constexpr std::uint32_t i2c_intr_mask = 0x3fff;  /*!< I2C all interrupt bitmap */
-  static constexpr std::uint32_t I2C_FIFO_FULL_THRESH_VAL      = 1;
-  static constexpr std::uint32_t I2C_FIFO_EMPTY_THRESH_VAL     = 2;
-  static constexpr std::uint32_t I2C_SLAVE_TIMEOUT_DEFAULT     = 0xFFFFF; /* I2C slave timeout value, APB clock cycle number */
-  static constexpr std::uint32_t I2C_SLAVE_SDA_SAMPLE_DEFAULT  = 4;       /* I2C slave sample time after scl positive edge default value */
-  static constexpr std::uint32_t I2C_SLAVE_SDA_HOLD_DEFAULT    = 4;       /* I2C slave hold time after scl negative edge default value */
-
-  struct i2c_obj_t
+  namespace
   {
-    intr_handle_t intr_handle;  // I2C interrupt handle
-    i2c_port_t i2c_num;   // I2C port number
-    xTaskHandle main_handle = nullptr;
-    std::uint32_t addr;   // I2C slave addr
-  };
+    constexpr std::uint32_t RX_FIFO_FULL_THRESHOLD = 1;
+    constexpr std::uint32_t TX_FIFO_EMPTY_THRESHOLD = 2;
+    // C61 encodes this as an exponent: timeout period = 2^value source clocks.
+    constexpr std::uint32_t SLAVE_TIMEOUT = 22;
+    constexpr std::uint32_t INTERRUPT_MASK = I2C_INTR_SLV_RXFIFO_WM
+                                           | I2C_INTR_SLV_TXFIFO_WM
+                                           | I2C_INTR_SLV_COMPLETE
+                                           | I2C_INTR_START
+                                           | I2C_INTR_STRETCH;
 
-  i2c_obj_t i2c_obj;
+    struct i2c_object_t
+    {
+      intr_handle_t interrupt_handle = nullptr;
+      i2c_port_t port = I2C_NUM_0;
+      TaskHandle_t main_handle = nullptr;
+      std::uint8_t address = 0;
+    };
+
+    i2c_object_t i2c_object;
+    bool initialized = false;
+    volatile std::uint32_t diagnostic_interrupts = 0;
+    volatile std::uint32_t diagnostic_last_status = 0;
+    volatile std::uint32_t diagnostic_rx_bytes = 0;
+    volatile std::uint32_t diagnostic_tx_fifo_events = 0;
+    volatile std::uint32_t diagnostic_tx_bytes = 0;
+    volatile std::uint32_t diagnostic_stretch_address = 0;
+    volatile std::uint32_t diagnostic_stretch_tx_empty = 0;
+    volatile std::uint32_t diagnostic_stretch_other = 0;
+
+    i2c_dev_t* hardware()
+    {
+      return I2C_LL_GET_HW(i2c_object.port);
+    }
+
+    bool configure_pins(int pin_sda, int pin_scl)
+    {
+      const gpio_config_t config = {
+        .pin_bit_mask = (1ULL << pin_sda) | (1ULL << pin_scl),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+      };
+
+      if (gpio_config(&config) != ESP_OK)
+      {
+        return false;
+      }
+
+      gpio_set_level(static_cast<gpio_num_t>(pin_sda), 1);
+      gpio_set_level(static_cast<gpio_num_t>(pin_scl), 1);
+      const auto& signals = i2c_periph_signal[i2c_object.port];
+      esp_rom_gpio_connect_out_signal(pin_sda, signals.sda_out_sig, false, false);
+      esp_rom_gpio_connect_in_signal(pin_sda, signals.sda_in_sig, false);
+      esp_rom_gpio_connect_out_signal(pin_scl, signals.scl_out_sig, false, false);
+      esp_rom_gpio_connect_in_signal(pin_scl, signals.scl_in_sig, false);
+      return true;
+    }
+
+    void configure_peripheral()
+    {
+      i2c_ll_enable_bus_clock(i2c_object.port, true);
+      i2c_ll_reset_register(i2c_object.port);
+
+      auto* device = hardware();
+      i2c_hal_context_t hal = {.dev = device};
+      i2c_ll_enable_controller_clock(device, true);
+      i2c_ll_set_source_clk(device, I2C_CLK_SRC_DEFAULT);
+      i2c_hal_slave_init(&hal);
+      i2c_ll_enable_fifo_mode(device, true);
+      i2c_ll_set_slave_addr(device, i2c_object.address, false);
+      i2c_ll_set_txfifo_empty_thr(device, TX_FIFO_EMPTY_THRESHOLD);
+      i2c_ll_set_rxfifo_full_thr(device, RX_FIFO_FULL_THRESHOLD);
+      i2c_ll_set_sda_timing(device, 10, 10);
+      i2c_ll_set_tout(device, SLAVE_TIMEOUT);
+      i2c_ll_slave_enable_scl_stretch(device, true);
+      i2c_ll_slave_enable_auto_start(device, true);
+      i2c_ll_clear_intr_mask(device, UINT32_MAX);
+      i2c_ll_update(device);
+    }
+
+    void IRAM_ATTR interrupt_handler(void* argument)
+    {
+      auto* object = static_cast<i2c_object_t*>(argument);
+      auto* device = I2C_LL_GET_HW(object->port);
+      std::uint32_t interrupt_status = 0;
+      i2c_ll_get_intr_mask(device, &interrupt_status);
+      i2c_ll_clear_intr_mask(device, interrupt_status);
+      ++diagnostic_interrupts;
+      diagnostic_last_status = interrupt_status;
+
+      std::uint32_t rx_count = 0;
+      i2c_ll_get_rxfifo_cnt(device, &rx_count);
+      bool notify = false;
+      bool received_data = false;
+      std::uint8_t data[32];
+      while (rx_count != 0)
+      {
+        const auto length = static_cast<std::uint8_t>(std::min<std::uint32_t>(rx_count, sizeof(data)));
+        i2c_ll_read_rxfifo(device, data, length);
+        diagnostic_rx_bytes += length;
+        received_data = true;
+        for (std::uint8_t index = 0; index < length; ++index)
+        {
+          notify |= command_processor::addData(data[index]);
+        }
+        rx_count -= length;
+      }
+
+      if (received_data)
+      {
+        i2c_ll_txfifo_rst(device);
+        command_processor::prepareTxData();
+      }
+
+      if (!received_data && (interrupt_status & I2C_INTR_SLV_TXFIFO_WM))
+      {
+        ++diagnostic_tx_fifo_events;
+        command_processor::prepareTxData();
+      }
+
+      if (interrupt_status & (I2C_INTR_SLV_COMPLETE | I2C_INTR_START))
+      {
+        command_processor::closeData();
+      }
+
+      if (interrupt_status & I2C_INTR_STRETCH)
+      {
+        i2c_slave_stretch_cause_t stretch_cause;
+        i2c_ll_slave_get_stretch_cause(device, &stretch_cause);
+        if (stretch_cause == I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH)
+        {
+          ++diagnostic_stretch_address;
+          std::uint32_t tx_available = 0;
+          i2c_ll_get_txfifo_len(device, &tx_available);
+          if (tx_available == SOC_I2C_FIFO_LEN)
+          {
+            command_processor::prepareTxData();
+          }
+        }
+        else if (stretch_cause == I2C_SLAVE_STRETCH_CAUSE_TX_EMPTY)
+        {
+          ++diagnostic_stretch_tx_empty;
+          command_processor::prepareTxData();
+        }
+        else
+        {
+          ++diagnostic_stretch_other;
+        }
+        i2c_ll_slave_clear_stretch(device);
+      }
+
+      if (notify)
+      {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(object->main_handle, &higher_priority_task_woken);
+        if (higher_priority_task_woken == pdTRUE)
+        {
+          portYIELD_FROM_ISR();
+        }
+      }
+    }
+  }
 
   bool IRAM_ATTR is_busy(void)
   {
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    return dev->status_reg.bus_busy;
-  }
-
-  static void IRAM_ATTR i2c_isr_handler(void *arg)
-  {
-    auto p_i2c = (i2c_obj_t*)arg;
-    auto dev = p_i2c->i2c_num == 0 ? &I2C0 : &I2C1;
-
-    std::uint32_t rx_fifo_cnt = dev->status_reg.rx_fifo_cnt;
-    typeof(dev->int_status) int_sts;
-    int_sts.val = dev->int_status.val;
-    if (rx_fifo_cnt)
-    {
-      bool notify = false;
-      do
-      {
-        if (command_processor::addData(dev->fifo_data.data))
-        {
-          notify = true;
-        }  
-      } while (--rx_fifo_cnt);
-      if (notify)
-      {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        vTaskNotifyGiveFromISR(p_i2c->main_handle, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR();
-      }
-    }
-    if (int_sts.tx_fifo_empty)
-    {
-      command_processor::prepareTxData();
-    }
-    if (int_sts.trans_complete || int_sts.trans_start || int_sts.arbitration_lost)
-    {
-      command_processor::closeData();
-    }
-    dev->int_clr.val = int_sts.val;
+    return initialized && i2c_ll_is_bus_busy(hardware());
   }
 
   void IRAM_ATTR clear_txdata(void)
   {
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    dev->int_ena.tx_fifo_empty = false;
-    dev->fifo_conf.tx_fifo_rst = 1;
-    dev->fifo_conf.tx_fifo_rst = 0;
+    auto* device = hardware();
+    i2c_ll_slave_disable_tx_it(device);
+    i2c_ll_txfifo_rst(device);
   }
 
-  void IRAM_ATTR add_txdata(const std::uint8_t* buf, std::size_t len)
+  void IRAM_ATTR add_txdata(const std::uint8_t* buffer, std::size_t length)
   {
-    uint32_t fifo_addr = (i2c_obj.i2c_num == 0) ? 0x6001301c : 0x6002701c;
-    for (std::size_t i = 0; i < len; ++i)
+    auto* device = hardware();
+    std::uint32_t available = 0;
+    i2c_ll_get_txfifo_len(device, &available);
+    const auto write_length = static_cast<std::uint8_t>(std::min<std::size_t>(length, available));
+    if (write_length != 0)
     {
-      WRITE_PERI_REG(fifo_addr, buf[i]);
+      i2c_ll_write_txfifo(device, buffer, write_length);
+      diagnostic_tx_bytes += write_length;
     }
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    dev->int_clr.tx_fifo_empty = true;
-    dev->int_ena.tx_fifo_empty = true;
+    i2c_ll_clear_intr_mask(device, I2C_INTR_SLV_TXFIFO_WM);
+    i2c_ll_slave_enable_tx_it(device);
   }
 
-  void IRAM_ATTR add_txdata(std::uint8_t buf)
+  void IRAM_ATTR add_txdata(std::uint8_t value)
   {
-    uint32_t fifo_addr = (i2c_obj.i2c_num == 0) ? 0x6001301c : 0x6002701c;
-    WRITE_PERI_REG(fifo_addr, buf);
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    dev->int_clr.tx_fifo_empty = true;
-    dev->int_ena.tx_fifo_empty = true;
+    add_txdata(&value, 1);
   }
 
   void IRAM_ATTR start_isr(void)
   {
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    dev->int_ena.val = I2C_RXFIFO_FULL_INT_ENA
-                     | I2C_TRANS_COMPLETE_INT_ENA
-                     | I2C_ARBITRATION_LOST_INT_ENA
-                     | I2C_TXFIFO_EMPTY_INT_ENA
-                     | I2C_TRANS_START_INT_ENA
-                     ;
-  /*
-  | I2C_ACK_ERR_INT_ENA_M
-  | I2C_END_DETECT_INT_ENA_M
-  | I2C_MASTER_TRAN_COMP_INT_ENA_M
-  | I2C_SLAVE_TRAN_COMP_INT_ENA_M
-  | I2C_TIME_OUT_INT_ENA_M
-  | I2C_TX_SEND_EMPTY_INT_ENA_M
-  | 0x3FFF
-  //*/
+    if (!initialized) return;
+    auto* device = hardware();
+    i2c_ll_clear_intr_mask(device, INTERRUPT_MASK);
+    i2c_ll_enable_intr_mask(device, INTERRUPT_MASK);
   }
 
   void IRAM_ATTR stop_isr(void)
   {
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-    dev->int_ena.val = 0;
-    dev->int_clr.val = i2c_intr_mask;
+    if (!initialized) return;
+    auto* device = hardware();
+    i2c_ll_disable_intr_mask(device, UINT32_MAX);
+    i2c_ll_clear_intr_mask(device, UINT32_MAX);
   }
 
-  void IRAM_ATTR i2c_periph_start(void)
+  bool init(int i2c_num, int pin_sda, int pin_scl, std::uint8_t i2c_addr, void* main_handle, int interrupt_flags)
   {
+    if (initialized || i2c_num != I2C_NUM_0 || main_handle == nullptr)
+    {
+      return false;
+    }
+
+    i2c_object.port = static_cast<i2c_port_t>(i2c_num);
+    i2c_object.address = i2c_addr;
+    i2c_object.main_handle = static_cast<TaskHandle_t>(main_handle);
+    if (!configure_pins(pin_sda, pin_scl))
+    {
+      return false;
+    }
+
+    configure_peripheral();
+    auto* device = hardware();
+    const esp_err_t result = esp_intr_alloc_intrstatus(
+      i2c_periph_signal[i2c_object.port].irq,
+      interrupt_flags,
+      reinterpret_cast<std::uint32_t>(i2c_ll_get_interrupt_status_reg(device)),
+      INTERRUPT_MASK,
+      interrupt_handler,
+      &i2c_object,
+      &i2c_object.interrupt_handle);
+
+    if (result != ESP_OK)
+    {
+      return false;
+    }
+
+    initialized = true;
+    start_isr();
+    return true;
+  }
+
+  void reset(void)
+  {
+    if (!initialized) return;
     stop_isr();
-    periph_module_enable((i2c_obj.i2c_num == 0) ? PERIPH_I2C0_MODULE : PERIPH_I2C1_MODULE);
-
-    auto dev = i2c_obj.i2c_num == 0 ? &I2C0 : &I2C1;
-
-    typeof(dev->ctr) ctrl_reg;
-    ctrl_reg.val = 0;
-    ctrl_reg.sda_force_out = 1;
-    ctrl_reg.scl_force_out = 1;
-    dev->ctr.val = ctrl_reg.val;
-
-    typeof(dev->fifo_conf) fifo_conf;
-    fifo_conf.val = 0;
-    fifo_conf.rx_fifo_full_thrhd = I2C_FIFO_FULL_THRESH_VAL;
-    fifo_conf.tx_fifo_empty_thrhd = I2C_FIFO_EMPTY_THRESH_VAL;
-    dev->fifo_conf.val = fifo_conf.val;
-
-    dev->slave_addr.addr = i2c_obj.addr;
-    dev->slave_addr.en_10bit = 0;
-
-    dev->sda_hold.time = I2C_SLAVE_SDA_HOLD_DEFAULT;
-    dev->sda_sample.time = I2C_SLAVE_SDA_SAMPLE_DEFAULT;
-    dev->timeout.tout = I2C_SLAVE_TIMEOUT_DEFAULT;
-
-    dev->scl_filter_cfg.en = 1;
-    dev->scl_filter_cfg.thres = 0;
-    dev->sda_filter_cfg.en = 1;
-    dev->sda_filter_cfg.thres = 0;
+    configure_peripheral();
     start_isr();
   }
 
-  bool IRAM_ATTR init(int i2c_num, int pin_sda, int pin_scl, std::uint8_t i2c_addr, void* mainHandle, int intr_alloc_flags)
+  void get_diagnostics(diagnostics_t* diagnostics)
   {
-    i2c_obj.i2c_num = (i2c_port_t)i2c_num;
-    i2c_obj.addr = i2c_addr;
-    i2c_obj.main_handle = mainHandle;
-
-    if ((ESP_OK == i2c_set_pin(i2c_obj.i2c_num, pin_sda, pin_scl, GPIO_PULLUP_ENABLE, GPIO_PULLUP_ENABLE, I2C_MODE_SLAVE))
-    && (ESP_OK == esp_intr_alloc( (i2c_num == 0)
-                          ? ETS_I2C_EXT0_INTR_SOURCE 
-                          : ETS_I2C_EXT1_INTR_SOURCE
-                        , intr_alloc_flags
-                        , i2c_isr_handler
-                        , &i2c_obj
-                        , &(i2c_obj.intr_handle)
-                        )))
-    {
-      i2c_periph_start();
-      return true;
-    }
-    return false;
+    if (diagnostics == nullptr) return;
+    diagnostics->interrupts = diagnostic_interrupts;
+    diagnostics->last_status = diagnostic_last_status;
+    diagnostics->rx_bytes = diagnostic_rx_bytes;
+    diagnostics->tx_fifo_events = diagnostic_tx_fifo_events;
+    diagnostics->tx_bytes = diagnostic_tx_bytes;
+    diagnostics->stretch_address = diagnostic_stretch_address;
+    diagnostics->stretch_tx_empty = diagnostic_stretch_tx_empty;
+    diagnostics->stretch_other = diagnostic_stretch_other;
   }
-
-  void IRAM_ATTR reset(void)
-  {
-    auto mod = i2c_obj.i2c_num == 0 ? PERIPH_I2C0_MODULE : PERIPH_I2C1_MODULE;
-    periph_module_disable(mod);
-    i2c_periph_start();
-  }
-
 }

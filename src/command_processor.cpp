@@ -1,27 +1,25 @@
 //! Copyright (c) M5Stack. All rights reserved.
 //! Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-#include <driver/i2c.h>
-#include <soc/i2c_reg.h>
-#include <soc/i2c_struct.h>
-#include <esp_task_wdt.h>
-#include <esp_sleep.h>
-#include <esp_pm.h>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <driver/ledc.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <cstring>
 
+#include <Arduino.h>
 #include <M5GFX.h>
 #include <lgfx/v1/panel/Panel_M5UnitLCD.hpp>
 #include <lgfx/v1/panel/Panel_ST7789.hpp>
-#include <lgfx/v1/platforms/esp32/Light_PWM.hpp>
 #include <lgfx/v1/platforms/esp32/Bus_SPI.hpp>
 
 #include "common.hpp"
-#include "logo.hpp"
+#include "board_config.hpp"
 #include "cpu_clock.hpp"
+#include "encoder_input.hpp"
 #include "i2c_slave.hpp"
+#include "unit_lcd_plus_protocol.hpp"
 #include "update.hpp"
 #include "command_processor.hpp"
 
@@ -30,10 +28,6 @@ namespace command_processor
   static constexpr char NVS_KEY_I2CADDR[] = "ADDR";
   static constexpr std::uint8_t read_id_data[] = { 0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION };
 
-  static constexpr gpio_num_t PIN_BL  = (gpio_num_t)4;
-  static constexpr gpio_num_t PIN_CS  = (gpio_num_t)5;
-  static constexpr gpio_num_t PIN_SDA = (gpio_num_t)21;  // 32 (for M5StickCPlus
-  static constexpr gpio_num_t PIN_SCL = (gpio_num_t)22;  // 33 (for M5StickCPlus
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
   static constexpr std::uint8_t I2C_MIN_ADDR = 0x08;
@@ -55,14 +49,74 @@ namespace command_processor
   std::uint32_t _argb8888 = ~0u;
   std::uint8_t _i2c_addr = I2C_DEFAULT_ADDR;
   lgfx::Panel_ST7789 _panel;
-  lgfx::Light_PWM _light;
   lgfx::Bus_SPI _spi_bus;
   LGFX_Device _lcd;
   LGFX_Sprite _canvas;
   bool _byteswap = false;
 
   bool _modified = true;
+  bool _dirty_valid = false;
+  std::uint_fast16_t _dirty_xs = 0;
+  std::uint_fast16_t _dirty_ys = 0;
+  std::uint_fast16_t _dirty_xe = 0;
+  std::uint_fast16_t _dirty_ye = 0;
+  bool _partial_flush_enabled = true;
+
   bool _nvs_push = false;
+
+  static inline void mark_modified(void)
+  {
+    _modified = true;
+  }
+
+  static inline void mark_modified_rect(std::int32_t x, std::int32_t y,
+                                        std::int32_t w, std::int32_t h)
+  {
+    if (!_partial_flush_enabled)
+    {
+      _dirty_xs = 0;
+      _dirty_ys = 0;
+      _dirty_xe = board_config::LCD_WIDTH - 1;
+      _dirty_ye = board_config::LCD_HEIGHT - 1;
+      _dirty_valid = true;
+      mark_modified();
+      return;
+    }
+    if (w <= 0 || h <= 0) return;
+    const auto xe = x + w - 1;
+    const auto ye = y + h - 1;
+    x = std::max<std::int32_t>(0, x);
+    y = std::max<std::int32_t>(0, y);
+    const auto max_x = static_cast<std::int32_t>(board_config::LCD_WIDTH) - 1;
+    const auto max_y = static_cast<std::int32_t>(board_config::LCD_HEIGHT) - 1;
+    const auto clipped_xe = std::min<std::int32_t>(max_x, xe);
+    const auto clipped_ye = std::min<std::int32_t>(max_y, ye);
+    if (x > clipped_xe || y > clipped_ye) return;
+    if (!_dirty_valid)
+    {
+      _dirty_xs = x; _dirty_ys = y;
+      _dirty_xe = clipped_xe; _dirty_ye = clipped_ye;
+      _dirty_valid = true;
+    }
+    else
+    {
+      _dirty_xs = std::min<std::uint_fast16_t>(_dirty_xs, x);
+      _dirty_ys = std::min<std::uint_fast16_t>(_dirty_ys, y);
+      _dirty_xe = std::max<std::uint_fast16_t>(_dirty_xe, clipped_xe);
+      _dirty_ye = std::max<std::uint_fast16_t>(_dirty_ye, clipped_ye);
+    }
+    mark_modified();
+  }
+
+  static inline void mark_full_modified(void)
+  {
+    _dirty_xs = 0;
+    _dirty_ys = 0;
+    _dirty_xe = board_config::LCD_WIDTH - 1;
+    _dirty_ye = board_config::LCD_HEIGHT - 1;
+    _dirty_valid = true;
+    mark_modified();
+  }
 
   enum firmupdate_state_t
   {
@@ -76,9 +130,65 @@ namespace command_processor
   std::size_t _firmupdate_index = 0;
   std::size_t _firmupdate_totalsize = 0;
   std::size_t _firmupdate_result = 0;
-  std::size_t IRAM_ATTR _last_command = 0;
+  std::size_t _last_command = 0;
+  std::uint8_t _encoder_state_response[unit_lcd_plus_protocol::ENCODER_STATE_SIZE] = {};
+  std::uint8_t _encoder_event_response[unit_lcd_plus_protocol::ENCODER_EVENT_SIZE] = {};
+  std::uint8_t _button_config_response[unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE] = {};
 
   std::uint_fast8_t _brightness = 128;
+  bool _backlight_pwm_attached = false;
+
+  static void set_backlight(std::uint8_t brightness)
+  {
+    constexpr ledc_mode_t speed_mode = LEDC_LOW_SPEED_MODE;
+    constexpr ledc_timer_t timer = LEDC_TIMER_0;
+    constexpr ledc_channel_t channel = LEDC_CHANNEL_0;
+
+    if (!_backlight_pwm_attached)
+    {
+      ledc_timer_config_t timer_config = {};
+      timer_config.speed_mode = speed_mode;
+      timer_config.duty_resolution = LEDC_TIMER_8_BIT;
+      timer_config.timer_num = timer;
+      timer_config.freq_hz = 5000;
+      timer_config.clk_cfg = LEDC_AUTO_CLK;
+
+      ledc_channel_config_t channel_config = {};
+      channel_config.gpio_num = board_config::PIN_LCD_BL;
+      channel_config.speed_mode = speed_mode;
+      channel_config.channel = channel;
+      channel_config.intr_type = LEDC_INTR_DISABLE;
+      channel_config.timer_sel = timer;
+      channel_config.duty = brightness;
+      channel_config.hpoint = 0;
+
+      _backlight_pwm_attached = ledc_timer_config(&timer_config) == ESP_OK
+                             && ledc_channel_config(&channel_config) == ESP_OK;
+    }
+
+    if (_backlight_pwm_attached
+     && ledc_set_duty(speed_mode, channel, brightness) == ESP_OK
+     && ledc_update_duty(speed_mode, channel) == ESP_OK)
+    {
+      return;
+    }
+
+    gpio_set_direction(board_config::PIN_LCD_BL, GPIO_MODE_OUTPUT);
+    gpio_set_level(board_config::PIN_LCD_BL, brightness ? 1 : 0);
+  }
+
+  static void flush_canvas_to_lcd(void)
+  {
+    // Keep the original, known-good framebuffer commit path. The sprite
+    // buffer is already in the panel's native 24-bit stream format.
+    _lcd.startWrite();
+    _lcd.setWindow(0, 0, board_config::LCD_WIDTH - 1,
+                   board_config::LCD_HEIGHT - 1);
+    _spi_bus.writeBytes(static_cast<const std::uint8_t*>(_canvas.getBuffer()),
+                        _canvas.bufferLength(), true, false);
+    _lcd.endWrite();
+    _dirty_valid = false;
+  }
 
   std::uint_fast16_t _xs = 0;
   std::uint_fast16_t _xe = 0;
@@ -180,9 +290,9 @@ namespace command_processor
   {
     switch (mode)
     {
-    case 0:  cpu_clock::set_clock_limit(cpu_clock::clock_20MHz,  cpu_clock::clock_20MHz ); break;
+    case 0:  cpu_clock::set_clock_limit(cpu_clock::clock_40MHz,  cpu_clock::clock_40MHz ); break;
     case 1:  cpu_clock::set_clock_limit(cpu_clock::clock_80MHz,  cpu_clock::clock_160MHz); break;
-    case 2:  cpu_clock::set_clock_limit(cpu_clock::clock_240MHz, cpu_clock::clock_240MHz); break;
+    case 2:  cpu_clock::set_clock_limit(cpu_clock::clock_160MHz, cpu_clock::clock_160MHz); break;
     }
   }
 
@@ -249,12 +359,12 @@ namespace command_processor
       if (params[1])
       {
         _lcd.sleep();
-        _lcd.setBrightness(0);
+        set_backlight(0);
       }
       else
       {
         _lcd.wakeup();
-        _lcd.setBrightness(_brightness);
+        set_backlight(_brightness);
       }
       break;
 
@@ -265,12 +375,17 @@ namespace command_processor
 
     case lgfx::Panel_M5UnitLCD::CMD_BRIGHTNESS:
       _brightness = params[1];
-      _lcd.setBrightness(_brightness);
+      set_backlight(_brightness);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_ROTATE:
       {
         _canvas.setRotation(params[1]);
+        // Sprite coordinate transforms change the backing-store layout. Keep
+        // the legacy full-frame path for rotated modes; partial transfers are
+        // used for the normal orientation where the buffer is row-contiguous.
+        _partial_flush_enabled = (params[1] == 0);
+        mark_full_modified();
       }
       break;
 
@@ -310,7 +425,9 @@ namespace command_processor
                 , params[1]
                 , params[2]
                 );
-      _modified = true;
+      mark_modified_rect(params[5], params[6],
+                         params[3] - params[1] + 1,
+                         params[4] - params[2] + 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_SET_COLOR_8:
@@ -339,7 +456,7 @@ namespace command_processor
       {
         _canvas.fillRectAlpha(_xs, _ys, 1, 1, _argb8888 >> 24, _argb8888);
       }
-      _modified = true;
+      mark_modified_rect(_xs, _ys, 1, 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_FILLRECT_8:
@@ -380,7 +497,7 @@ namespace command_processor
       {
         _canvas.fillRectAlpha(_xs, _ys, _xe - _xs + 1, _ye - _ys + 1, _argb8888 >> 24, _argb8888);
       }
-      _modified = true;
+      mark_modified_rect(_xs, _ys, _xe - _xs + 1, _ye - _ys + 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_8:
@@ -441,12 +558,12 @@ namespace command_processor
           _xptr = xptr;
         }
       }
-      _modified = true;
+      mark_modified_rect(_xs, _ys, _xe - _xs + 1, _ye - _ys + 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_BEGIN:
       _modified = false;
-      cpu_clock::request_clock_up(cpu_clock::clock_240MHz);
+      cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
       update::initCRCtable();
       _lcd.fillScreen(TFT_WHITE);
       _lcd.drawString("update", 0, 0);
@@ -470,7 +587,7 @@ namespace command_processor
       }
 
       _firmupdate_state = firmupdate_state_t::wait_data;
-      _firmupdate_index += SPI_FLASH_SEC_SIZE;
+      _firmupdate_index += update::BLOCK_SIZE;
       _lcd.fillCircle( 10 + (_lcd.width() - 20) * _firmupdate_index / _firmupdate_totalsize, 120, 4, TFT_GREEN );
       //_nvs_push = false;
       break;
@@ -494,41 +611,29 @@ namespace command_processor
     return true;
   }
 
-  static void IRAM_ATTR setupTask(void* masterHandler)
+  void setup(void)
   {
-    i2c_slave::init(I2C_PORT, PIN_SDA, PIN_SCL, _i2c_addr, masterHandler, ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
-    vTaskDelete(NULL);
-  }
-
-  void IRAM_ATTR setup(void)
-  {
-    lgfx::gpio_hi(PIN_BL);
-    lgfx::pinMode(PIN_BL, lgfx::pin_mode_t::output);
+    set_backlight(_brightness);
 
     load_nvs();
-
-    xTaskCreatePinnedToCore(setupTask, "setupTask", 8192, xTaskGetCurrentTaskHandle(), 0, NULL, 0);
 
 #if DEBUG == 1
     lgfx::pinMode(0, lgfx::pin_mode_t::output);
     lgfx::gpio_hi(0);
 #endif
 
-    TaskHandle_t idle = xTaskGetIdleTaskHandleForCPU(0);
-    if (idle != nullptr) esp_task_wdt_delete(idle);
-    idle = xTaskGetIdleTaskHandleForCPU(1);
-    if (idle != nullptr) esp_task_wdt_delete(idle);
-  //*/
     {
       auto cfg = _spi_bus.config();
-      cfg.spi_host = VSPI_HOST;
-      cfg.dma_channel = 2;
+      cfg.spi_host = SPI2_HOST;
+      // C61's current generic GDMA path can stall during full-frame transfers.
+      // Disable DMA so M5GFX uses its synchronous register conversion path.
+      cfg.dma_channel = 0;
       cfg.freq_write = 40000000;
       cfg.freq_read  = 14000000;
-      cfg.pin_mosi = 15;
-      cfg.pin_miso = 14;
-      cfg.pin_sclk = 13;
-      cfg.pin_dc   = 23;
+      cfg.pin_mosi = board_config::PIN_LCD_MOSI;
+      cfg.pin_miso = -1;
+      cfg.pin_sclk = board_config::PIN_LCD_SCLK;
+      cfg.pin_dc   = board_config::PIN_LCD_DC;
       cfg.spi_3wire = true;
       cfg.spi_mode = 3;
       _spi_bus.config(cfg);
@@ -537,29 +642,22 @@ namespace command_processor
       auto cfg = _panel.config();
       cfg.invert = true;
 
-      cfg.pin_cs  = 5;
-      cfg.pin_rst = 18;
-      cfg.panel_width  = 135;
-      cfg.panel_height = 240;
-      cfg.offset_x     = 52;
-      cfg.offset_y     = 40;
+      cfg.pin_cs  = board_config::PIN_LCD_CS;
+      cfg.pin_rst = board_config::PIN_LCD_RST;
+      cfg.panel_width  = board_config::LCD_WIDTH;
+      cfg.panel_height = board_config::LCD_HEIGHT;
+      cfg.offset_x     = board_config::LCD_OFFSET_X;
+      cfg.offset_y     = board_config::LCD_OFFSET_Y;
       _panel.config(cfg);
     }
-    {
-      auto cfg = _light.config();
-      cfg.invert = true;
-      cfg.freq = 44100;
-      cfg.pin_bl = PIN_BL;
-      cfg.pwm_channel = 7;
-      _light.config(cfg);
-    }
     _panel.setBus(&_spi_bus);
-    _panel.setLight(&_light);
     _lcd.setPanel(&_panel);
-    _lcd.init();
+    const bool lcd_init_ok = _lcd.init();
+    ESP_LOGI(LOGNAME, "LCD init=%d", lcd_init_ok);
     _lcd.startWrite();
+    ESP_LOGI(LOGNAME, "LCD startWrite complete");
     _lcd.fillScreen(TFT_WHITE);
-    _lcd.drawBmp(logo, logo_len, 0, 0, _lcd.width(), _lcd.height(), 0, 0, 1.0,1.0,lgfx::datum_t::middle_center);
+    ESP_LOGI(LOGNAME, "LCD fillScreen complete");
     _lcd.setTextColor(TFT_BLACK, TFT_WHITE);
 
     _lcd.setFont(&fonts::Font4);
@@ -567,21 +665,58 @@ namespace command_processor
     _lcd.printf("Addr : 0x%02x", _i2c_addr);
     _lcd.setCursor(0,216);
     _lcd.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
-    _brightness = _lcd.getBrightness();
+    ESP_LOGI(LOGNAME, "LCD startup text complete");
     _lcd.setColorDepth(24);
     _canvas.setColorDepth (24);
 
-    _modified = true;
+    // Keep the address/version splash visible until the host sends a draw command.
+    _modified = false;
     _lcd.setRotation(0);
     _lcd.setWindow(0, 0, _lcd.width()-1, _lcd.height()-1);
     _canvas.createSprite(_lcd.width(), _lcd.height());
     _canvas.setRotation(0);
+    // The splash was drawn directly to the panel. Mirror it into the backing
+    // store so the first partial host update starts from the same frame.
+    _canvas.fillScreen(TFT_WHITE);
+    _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
+    _canvas.setFont(&fonts::Font4);
+    _canvas.setCursor(0, 0);
+    _canvas.printf("Addr : 0x%02x", _i2c_addr);
+    _canvas.setCursor(0, 216);
+    _canvas.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
+    _dirty_valid = false;
+    _lcd.endWrite();
+    ESP_LOGI(LOGNAME, "LCD canvas complete");
 
     cpu_clock::init();
     cpu_clock::request_clock_down(cpu_clock::clock_80MHz);
     set_power_mode(1);
+    ESP_LOGI(LOGNAME, "CPU clock setup complete");
 
-    ulTaskNotifyTake( pdTRUE, 5000 / portTICK_PERIOD_MS );
+    const bool encoder_init_ok = encoder_input::setup();
+    ESP_LOGI(LOGNAME, "Encoder init=%d A=%d B=%d button=%d",
+             encoder_init_ok,
+             board_config::PIN_ENCODER_A,
+             board_config::PIN_ENCODER_B,
+             board_config::PIN_ENCODER_BUTTON);
+
+    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
+                                             board_config::PIN_I2C_SDA,
+                                             board_config::PIN_I2C_SCL,
+                                             _i2c_addr,
+                                             xTaskGetCurrentTaskHandle(),
+                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
+             i2c_init_ok,
+             _i2c_addr,
+             board_config::PIN_I2C_SDA,
+             gpio_get_level(board_config::PIN_I2C_SDA),
+             board_config::PIN_I2C_SCL,
+             gpio_get_level(board_config::PIN_I2C_SCL));
+    if (!i2c_init_ok)
+    {
+      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
+    }
   /*
     auto ms = lgfx::millis();
     lgfx::pinMode(0, lgfx::pin_mode_t::input_pullup);
@@ -610,23 +745,47 @@ namespace command_processor
   void IRAM_ATTR loop(void)
   {
     ulTaskNotifyTake( pdTRUE, 0 );
-    if (!command() && !_modified && _firmupdate_state == firmupdate_state_t::nothing)
+    static std::uint32_t last_diagnostic_interrupts = 0;
+    i2c_slave::diagnostics_t diagnostics;
+    i2c_slave::get_diagnostics(&diagnostics);
+    if (diagnostics.interrupts != last_diagnostic_interrupts)
     {
-      cpu_clock::request_clock_down(cpu_clock::clock_20MHz);
-      ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
-      cpu_clock::request_clock_up(cpu_clock::clock_240MHz);
+      last_diagnostic_interrupts = diagnostics.interrupts;
+      ESP_LOGI(LOGNAME,
+               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u stretch(addr=%u tx=%u other=%u) cmd=0x%02x",
+               diagnostics.interrupts,
+               diagnostics.last_status,
+               diagnostics.rx_bytes,
+               diagnostics.tx_fifo_events,
+               diagnostics.tx_bytes,
+               diagnostics.stretch_address,
+               diagnostics.stretch_tx_empty,
+               diagnostics.stretch_other,
+               static_cast<unsigned>(_last_command));
     }
+    bool processed_command = false;
+    while (command())
+    {
+      processed_command = true;
+    }
+    if (!processed_command && !_modified && _firmupdate_state == firmupdate_state_t::nothing)
+    {
+      cpu_clock::request_clock_down(cpu_clock::clock_40MHz);
+      // Address persistence and OTA deliberately suppress ISR task notifications
+      // while flash is involved. Poll briefly so those queued commands cannot
+      // leave the single-core C61 main task asleep indefinitely.
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+      cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
+    }
+    // The framebuffer is committed after the commands currently available in
+    // the RX queue have been applied. Only the accumulated dirty rectangle is
+    // transferred, so a local update never sends or clears the whole screen.
     if (_modified && !_spi_bus.busy())
     {
-#if DEBUG == 1
-auto bf = (int)getBufferFree();
-memset(_canvas.getBuffer(), 0xFF, bf);
-memset((std::uint8_t*)_canvas.getBuffer() + bf, 0, RX_BUFFER_MAX - bf + 1);
-#endif
       _modified = false;
-      _lcd.setWindow(0, 0, _lcd.width()-1, _lcd.height()-1);
-      _spi_bus.writeBytes((std::uint8_t*)_canvas.getBuffer(), _canvas.bufferLength(), true, true);
-      //lcd.writePixels(static_cast<lgfx::swap565_t*>(sp.getBuffer()), sp.bufferLength()>>1);
+      // M5GFX's generic C61 GDMA path does not complete reliably. Send the
+      // panel's native 24-bit stream through the synchronous register path.
+      flush_canvas_to_lcd();
     }
   }
 
@@ -664,6 +823,9 @@ memset((std::uint8_t*)_canvas.getBuffer() + bf, 0, RX_BUFFER_MAX - bf + 1);
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+      case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+      case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+      case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
         _param_need_count = 1;
         break;
 
@@ -735,6 +897,15 @@ memset((std::uint8_t*)_canvas.getBuffer() + bf, 0, RX_BUFFER_MAX - bf + 1);
       case lgfx::Panel_M5UnitLCD::CMD_UPDATE_BEGIN:
       case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
         _param_need_count = 8;
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_ACK_ENCODER_EVENT:
+      case unit_lcd_plus_protocol::CMD_SET_BUTTON_CONFIG:
+        _param_need_count = 3;
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_SET_ENCODER_POSITION:
+        _param_need_count = 5;
         return false;
       }
     }
@@ -884,6 +1055,39 @@ memset((std::uint8_t*)_canvas.getBuffer() + bf, 0, RX_BUFFER_MAX - bf + 1);
         prepareTxData();
         closeData();
         return false;
+
+      case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+        encoder_input::read_state(_encoder_state_response);
+        prepareTxData();
+        closeData();
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+        encoder_input::peek_event(_encoder_event_response);
+        prepareTxData();
+        closeData();
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_ACK_ENCODER_EVENT:
+        encoder_input::acknowledge(unit_lcd_plus_protocol::read_u16_be(&_params[1]));
+        closeData();
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_SET_ENCODER_POSITION:
+        encoder_input::set_position(unit_lcd_plus_protocol::read_i32_be(&_params[1]));
+        closeData();
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+        encoder_input::read_button_config(_button_config_response);
+        prepareTxData();
+        closeData();
+        return false;
+
+      case unit_lcd_plus_protocol::CMD_SET_BUTTON_CONFIG:
+        encoder_input::set_button_config(unit_lcd_plus_protocol::read_u16_be(&_params[1]));
+        closeData();
+        return false;
       }
 
       auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
@@ -937,11 +1141,23 @@ memset((std::uint8_t*)_canvas.getBuffer() + bf, 0, RX_BUFFER_MAX - bf + 1);
             if (buf_free > 0) buf_free -= RX_BUFFER_MAX;
             // 
             buf_free = (buf_free + 512) >> 1;
-            res = std::max(1, std::min(254, buf_free));
+            res = std::max<std::int32_t>(1, std::min<std::int32_t>(254, buf_free));
           }
         }
         i2c_slave::add_txdata((std::uint8_t*)&res, 1);
       }
+      break;
+
+    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+      i2c_slave::add_txdata(_encoder_state_response, sizeof(_encoder_state_response));
+      break;
+
+    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+      i2c_slave::add_txdata(_encoder_event_response, sizeof(_encoder_event_response));
+      break;
+
+    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+      i2c_slave::add_txdata(_button_config_response, sizeof(_button_config_response));
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:

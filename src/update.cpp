@@ -15,7 +15,7 @@ namespace update
 {
   static constexpr std::size_t SKIP_SIZE = 16;
   std::uint8_t _header_buffer[SKIP_SIZE];
-  std::uint8_t _buffer[SPI_FLASH_SEC_SIZE];
+  std::uint8_t _buffer[BLOCK_SIZE];
   std::size_t _bufindex = 0;
   std::size_t _totalindex = 0;
   std::size_t _totalsize = 0;
@@ -81,14 +81,14 @@ namespace update
 
   bool IRAM_ATTR addData(std::uint8_t data)
   {
-    if (_bufindex >= SPI_FLASH_SEC_SIZE)
+    if (_bufindex >= BLOCK_SIZE)
     {
       return false;
     }
     _calc_crc32 = (_calc_crc32 << 8) ^ _crc_table[((_calc_crc32 >> 24) ^ data) & 0xff];
     _buffer[_bufindex++] = data;
     ++_totalindex;
-    return (_bufindex < SPI_FLASH_SEC_SIZE && _totalindex < _totalsize);
+    return (_bufindex < BLOCK_SIZE && _totalindex < _totalsize);
   }
 
   bool IRAM_ATTR checkCRC32(void)
@@ -99,7 +99,7 @@ namespace update
   static void writeTask(void* args)
   {
     auto info = (write_info_t*)args;
-    if ((!info->finish && (ESP_OK != esp_partition_erase_range(_partition, info->offset, SPI_FLASH_SEC_SIZE)))
+    if ((!info->finish && (ESP_OK != esp_partition_erase_range(_partition, info->offset, BLOCK_SIZE)))
      || (ESP_OK != esp_partition_write(_partition, info->offset, info->buffer, info->len))
      || (info->finish && (ESP_OK != esp_ota_set_boot_partition(_partition))))
     {
@@ -120,9 +120,17 @@ namespace update
     info.len = len;
     info.finish = finish;
 
-    /// Core1で書き込みを行うとクラッシュする事があるためCore0で書き込みを行う
-    xTaskCreatePinnedToCore(writeTask, "writeTask", 4096, &info, 2, nullptr, 0);
-    while (info.status == write_info_t::status_t::none) taskYIELD();
+    if (xTaskCreate(writeTask, "writeTask", 4096, &info, 2, nullptr) != pdPASS)
+    {
+      ESP_LOGE(LOGNAME, "OTA write task allocation failed");
+      return false;
+    }
+    do
+    {
+      // Deleted task stacks are reclaimed by the idle task. A pure yield from
+      // the higher-priority Arduino loop starves idle after a few OTA blocks.
+      vTaskDelay(1);
+    } while (info.status == write_info_t::status_t::none);
     return info.status == write_info_t::status_t::ok;
   }
 

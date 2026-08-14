@@ -13,7 +13,19 @@
 
 namespace i2c_slave
 {
-  bool init(int i2c_num, int pin_sda, int pin_scl, std::uint8_t i2c_addr, void* mainHandle, int intr_alloc_flags);
+  struct diagnostics_t
+  {
+    std::uint32_t interrupts;
+    std::uint32_t last_status;
+    std::uint32_t rx_bytes;
+    std::uint32_t tx_fifo_events;
+    std::uint32_t tx_bytes;
+    std::uint32_t stretch_address;
+    std::uint32_t stretch_tx_empty;
+    std::uint32_t stretch_other;
+  };
+
+  bool init(int i2c_num, int pin_sda, int pin_scl, std::uint8_t i2c_addr, void* main_handle, int interrupt_flags);
   bool is_busy(void);
   void start_isr(void);
   void stop_isr(void);
@@ -21,4 +33,5 @@ namespace i2c_slave
   void add_txdata(const std::uint8_t* buf, std::size_t len);
   void add_txdata(std::uint8_t buf);
   void clear_txdata(void);
+  void get_diagnostics(diagnostics_t* diagnostics);
 }

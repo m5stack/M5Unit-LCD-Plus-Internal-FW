@@ -38,6 +38,13 @@ After it is successful, please remove the Unit.
 
 ## About Communication with Unit LCD
 
+Unit LCD Plus firmware 0.5 also provides encoder and button commands `0xB0`
+through `0xB5`. They expose a current-state snapshot, a 64-entry event queue
+with explicit sequence acknowledgement, press/release/single-click/double-click/
+long-press events, and a configurable 500..5000 ms long-press threshold. See
+[`docs/encoder_protocol.md`](../docs/encoder_protocol.md) for the byte layouts,
+flags, event types, overflow behavior, and timing.
+
  - You can send commands and receive data to the Unit LCD using I2C communication.
  - The maximum communication speed of I2C communication is 400kHz.
  - The initial value of the 7-bit address of I2C is 0x3E. It can be changed with the CHANGE_ADDR command.
