@@ -1,48 +1,53 @@
-# Product Name
+# Unit LCD Plus Internal Firmware
 
-## Overview
+Arduino/PlatformIO firmware for M5Stack Unit LCD Plus with ESP32-C61.
 
-### SKU:xxx
+This project is adapted from
+[`M5Unit-LCD-Internal-FW`](https://github.com/m5stack/M5Unit-LCD-Internal-FW)
+at commit `6b345872f033dc85fd56e7af722b31583a587a88`. The Unit LCD I2C protocol
+and default address (`0x3E`) remain compatible. Firmware 0.5 adds a compatible
+encoder and button protocol in the previously unused `0xB0` through `0xB5`
+range.
 
-Description of the product
+## Build
 
-## Related Link
+PlatformIO environments:
 
-- [Document & Datasheet](https://docs.m5stack.com/en/unit/product_Link)
+| Environment | Purpose |
+| --- | --- |
+| `release` | Production internal firmware, version 0.5 |
+| `iap_test` | Temporary version 0.6 image for online-update validation |
+| `debug` | Debug build of the internal firmware |
 
-## Required Libraries:
-
-- [Adafruit_BMP280_Library](https://github.com/adafruit/Required_Libraries_Link)
-
-## License
-
-- [Product Name- MIT](LICENSE)
-
-## Remaining steps(Editorial Staff Look,After following the steps, remember to delete all the content below)
-
-1. Change [clang format check path](./.github/workflows/clang-format-check.yml#L42-L47).
-2. Add License content to [LICENSE](/LICENSE).
-3. Change link on line 78 of [bug-report.yml](./.github/ISSUE_TEMPLATE/bug-report.yml#L79).
-
-```cpp
-Example
-# M5Unit-ENV
-
-## Overview
-
-### SKU:U001 & U001-B & U001-C
-
-Contains M5Stack-**UNIT ENV** series related case programs.ENV is an environmental sensor with integrated SHT30 and QMP6988 internally to detect temperature, humidity, and atmospheric pressure data.
-
-## Related Link
-
-- [Document & Datasheet](https://docs.m5stack.com/en/unit/envIII)
-
-## Required Libraries:
-
-- [Adafruit_BMP280_Library](https://github.com/adafruit/Adafruit_BMP280_Library)
-
-## License
-
-- [M5Unit-ENV - MIT](LICENSE)
+```bash
+pio run -e release
+pio run -e iap_test
 ```
+
+Direct USB flashing uses 921600 baud:
+
+```bash
+pio run -e release -t upload --upload-port /dev/ttyACM0
+pio device monitor --port /dev/ttyACM0 --baud 115200
+```
+
+See `docs/Unit_LCD_Plus_I2C_Protocol_zh.md` for the complete display, input,
+address, reset, and IAP protocol. See `docs/encoder_button_protocol_zh.md` or
+`docs/encoder_protocol.md` for additional encoder event and ACK details.
+
+## Unit LCD Plus Pins
+
+| Function | ESP32-C61 GPIO |
+| --- | ---: |
+| Grove SDA / SCL | 5 / 6 |
+| UART0 RX / TX | 10 / 11 |
+| LCD RST / D-C | 23 / 22 |
+| LCD MOSI / SCLK / CS | 28 / 27 / 26 |
+| LCD backlight enable | 25, active high |
+| Encoder A / B / button | 2 / 3 / 4 |
+
+The internal canvas uses a three-byte RGB stream for compatibility with the
+original firmware. M5GFX programs the ST7789 with `COLMOD=0x66`, so the panel
+interface is RGB666 even though the internal API color depth is named 24-bit.
+External controllers can continue to use the RGB332, RGB565, and RGB888
+protocol commands.
