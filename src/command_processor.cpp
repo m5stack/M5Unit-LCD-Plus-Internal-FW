@@ -1118,6 +1118,9 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
       case lgfx::Panel_M5UnitLCD::CMD_INVOFF:
       case lgfx::Panel_M5UnitLCD::CMD_INVON:
+      // RAM_FILL was missing from the classifier and became a NOP as an undefined command before reaching the executor.
+      // CMD_SET_COLOR shares the value 0x50, so accept it under the RAM_FILL name as a 1-byte command without a duplicate case.
+      case lgfx::Panel_M5UnitLCD::CMD_RAM_FILL:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
