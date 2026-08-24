@@ -114,6 +114,13 @@ namespace update
 
   static bool write(std::uint8_t* buf, std::size_t offset, std::size_t len, bool finish)
   {
+    /// Barrier against writing without begin() (or without an OTA partition).
+    /// esp_partition_* asserts and reboots when passed a nullptr.
+    if (_partition == nullptr)
+    {
+      return false;
+    }
+
     write_info_t info;
     info.buffer = buf;
     info.offset = offset;

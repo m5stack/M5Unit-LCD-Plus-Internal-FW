@@ -26,7 +26,9 @@
 namespace command_processor
 {
   static constexpr char NVS_KEY_I2CADDR[] = "ADDR";
-  static constexpr std::uint8_t read_id_data[] = { 0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION };
+  /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
+  /// arriving during an OTA flash write (cache disabled) would panic.
+  static const DRAM_ATTR std::uint8_t read_id_data[] = { 0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION };
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
@@ -48,6 +50,9 @@ namespace command_processor
   std::size_t _rle_abs = 0;
   std::uint32_t _argb8888 = ~0u;
   std::uint8_t _i2c_addr = I2C_DEFAULT_ADDR;
+  /// New address requested by CHANGE_ADDR. _i2c_addr itself is not changed until the NVS
+  /// save result is known, so operation continues on the current address if the save fails.
+  std::uint8_t _i2c_addr_request = 0;
   lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI _spi_bus;
   LGFX_Device _lcd;
@@ -211,7 +216,8 @@ namespace command_processor
   std::uint8_t cmd_detect[256] = {0};
   #endif
 
-  static void IRAM_ATTR save_nvs(void)
+  /// Saves the address to NVS. Returns true only if open / set / commit all succeed.
+  static bool IRAM_ATTR save_nvs(std::uint8_t addr)
   {
     i2c_slave::stop_isr();
 // #if DEBUG == 1
@@ -219,17 +225,19 @@ namespace command_processor
 // #endif
 
     std::uint32_t handle = 0;
-    nvs_open(LOGNAME, NVS_READWRITE, &handle);
-
-    nvs_set_u8(handle, NVS_KEY_I2CADDR, _i2c_addr);
-
-    nvs_commit(handle);
-    nvs_close(handle);
+    bool result = (ESP_OK == nvs_open(LOGNAME, NVS_READWRITE, &handle));
+    if (result)
+    {
+      result = (ESP_OK == nvs_set_u8(handle, NVS_KEY_I2CADDR, addr))
+            && (ESP_OK == nvs_commit(handle));
+      nvs_close(handle);
+    }
     i2c_slave::start_isr();
 
 // #if DEBUG == 1
 // lgfx::gpio_lo(0);
 // #endif
+    return result;
   }
 
   static void IRAM_ATTR update_argb8888(const std::uint8_t* data, std::size_t len)
@@ -273,7 +281,7 @@ namespace command_processor
       }
       ESP_LOGI(LOGNAME, "done.");
 
-      save_nvs();
+      save_nvs(_i2c_addr);
     }
     else  
     {
@@ -325,10 +333,14 @@ namespace command_processor
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
-
-      save_nvs();
-
-      esp_restart();
+      /// Reboot only once the NVS save (through commit) is confirmed. If the save failed,
+      /// keep running on the current address. _nvs_push must be cleared here, otherwise
+      /// READ_BUFCOUNT stays stuck at 1.
+      if (save_nvs(_i2c_addr_request))
+      {
+        esp_restart();
+      }
+      _nvs_push = false;
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_INVON:
@@ -1018,17 +1030,39 @@ namespace command_processor
         }
         break;
 
-      case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
-        if (_params[0] == _params[3]
-         && _params[1] == (0xFF & ~_params[2])
-         && _params[1] >= I2C_MIN_ADDR
-         && _params[1] <= I2C_MAX_ADDR
-         && _params[1] != _i2c_addr
+      /// Firmware update completion command
+      case lgfx::Panel_M5UnitLCD::CMD_UPDATE_END:
+        /// Discard without queueing when the magic mismatches or UPDATE_BEGIN has not run
+        /// (invalid commands have no side effect). Previously update::end() ran unchecked and a
+        /// unit without UPDATE_BEGIN rebooted on an esp_partition_write assert.
+        if ((_params[1] != 0x77)
+         || (_params[2] != 0x89)
+         || (_params[0] != _params[3])
+         || (_firmupdate_state == firmupdate_state_t::nothing)
         )
         {
-          _i2c_addr = _params[1];
-          _nvs_push = true;
+          closeData();
+          return false;
         }
+        break;
+
+      case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
+        /// A request that fails the validity rules (section 13.1: range, complement, matching
+        /// head and tail, different from the current address) is discarded without queueing
+        /// (invalid commands have no side effect). Previously save_nvs + esp_restart ran even
+        /// for invalid requests, rebooting without changing the address.
+        if (_params[0] != _params[3]
+         || _params[1] != (0xFF & ~_params[2])
+         || _params[1] < I2C_MIN_ADDR
+         || _params[1] > I2C_MAX_ADDR
+         || _params[1] == _i2c_addr
+        )
+        {
+          closeData();
+          return false;
+        }
+        _i2c_addr_request = _params[1];
+        _nvs_push = true;
         break;
 
       case lgfx::Panel_M5UnitLCD::CMD_CASET:
@@ -1108,7 +1142,8 @@ namespace command_processor
 
   void IRAM_ATTR prepareTxData(void)
   {
-    static constexpr std::uint8_t dummy[] = { 0xff, 0xff };
+    /// Kept in DRAM because the ISR reads it (same reason as read_id_data).
+    static const DRAM_ATTR std::uint8_t dummy[] = { 0xff, 0xff };
     switch (_last_command)
     {
     default:

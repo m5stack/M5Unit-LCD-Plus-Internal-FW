@@ -129,11 +129,11 @@ namespace i2c_slave
         rx_count -= length;
       }
 
-      if (received_data)
-      {
-        i2c_ll_txfifo_rst(device);
-        command_processor::prepareTxData();
-      }
+      // The reply must not be rebuilt here after RX. When the command completed,
+      // command_processor already ran clear_txdata() + prepareTxData(), and for
+      // READ_RAW prepareTxData() advances the read pointer by 8 pixels, so a second
+      // preparation drops the first 8 pixels and replies from the ninth.
+      // Windows of 1/2/4/8 pixels wrap around and hide the defect.
 
       if (!received_data && (interrupt_status & I2C_INTR_SLV_TXFIFO_WM))
       {
