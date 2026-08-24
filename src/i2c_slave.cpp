@@ -640,6 +640,22 @@ namespace i2c_slave
     return true;
   }
 
+  void shutdown(void)
+  {
+    if (!initialized) return;
+    stop_isr();
+    // Reset the module so the peripheral, still configured, does not answer the bus on its
+    // own (address match / auto_start read) while the chip reboots.
+#if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
+    i2c_ll_reset_register(i2c_object.port);
+#else
+    PERIPH_RCC_ATOMIC()
+    {
+      i2c_ll_reset_register(i2c_object.port);
+    }
+#endif
+  }
+
   void reset(void)
   {
     if (!initialized) return;

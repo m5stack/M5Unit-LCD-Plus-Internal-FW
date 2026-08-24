@@ -82,6 +82,9 @@ namespace command_processor
   bool _byteswap = false;
 
   bool _modified = true;
+  // Guard so the ISR never reads the unallocated sprite when READ_RAW arrives before the canvas exists.
+  // The window exists because the I2C slave is armed before the LCD is initialized.
+  volatile bool _canvas_ready = false;
   bool _dirty_valid = false;
   std::uint_fast16_t _dirty_xs = 0;
   std::uint_fast16_t _dirty_ys = 0;
@@ -426,6 +429,7 @@ namespace command_processor
       /// READ_BUFCOUNT stays stuck at 1.
       if (save_nvs(_i2c_addr_request))
       {
+        i2c_slave::shutdown();
         esp_restart();
       }
       _nvs_push = false;
@@ -702,6 +706,7 @@ namespace command_processor
         _lcd.drawString("success", 0, 144);
         ESP_LOGI(LOGNAME, "success! rebooting...");
         lgfx::delay(1000);
+        i2c_slave::shutdown();
         esp_restart();
       }
       else
@@ -746,6 +751,44 @@ namespace command_processor
     // UPDATE_BEGIN runs in the main task and the following UPDATE_DATA in the ISR, so building
     // the table between commands would race. Build it once at boot before the I2C interrupt is installed.
     update::initCRCtable();
+
+    // Arm the I2C slave before initializing the LCD. The released driver gives up its probe
+    // 300 ms + 8 x 32 ms after CMD_RESET, so the later the slave is armed the closer existing
+    // hosts get to that timeout. Draw commands that arrive before the LCD is ready stay in
+    // the RX queue and are processed once loop() starts. READ_RAW before the canvas exists
+    // returns 0 through the _canvas_ready guard.
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // On the original, keep the I2C ISR on core 0 as before, separate from the Arduino loop on core 1.
+    if (xTaskCreatePinnedToCore(setup_i2c_on_core0,
+                               "i2cSetup",
+                               8192,
+                               xTaskGetCurrentTaskHandle(),
+                               0,
+                               nullptr,
+                               0) != pdPASS)
+    {
+      ESP_LOGE(LOGNAME, "I2C setup task creation failed");
+    }
+#else
+    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
+                                             board_config::PIN_I2C_SDA,
+                                             board_config::PIN_I2C_SCL,
+                                             _i2c_addr,
+                                             xTaskGetCurrentTaskHandle(),
+                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
+             i2c_init_ok,
+             _i2c_addr,
+             board_config::PIN_I2C_SDA,
+             gpio_get_level(board_config::PIN_I2C_SDA),
+             board_config::PIN_I2C_SCL,
+             gpio_get_level(board_config::PIN_I2C_SCL));
+    if (!i2c_init_ok)
+    {
+      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
+    }
+#endif
+
 
 #if DEBUG == 1
     lgfx::pinMode(0, lgfx::pin_mode_t::output);
@@ -820,6 +863,7 @@ namespace command_processor
     drawSplash(_canvas);
     _canvas.setRotation(0);
     _dirty_valid = false;
+    _canvas_ready = true;
     _lcd.endWrite();
     ESP_LOGI(LOGNAME, "LCD canvas complete");
 
@@ -838,37 +882,6 @@ namespace command_processor
              board_config::PIN_ENCODER_BUTTON);
 #endif
 
-#if defined(CONFIG_IDF_TARGET_ESP32)
-    // On the original, keep the I2C ISR on core 0 as before, separate from the Arduino loop on core 1.
-    if (xTaskCreatePinnedToCore(setup_i2c_on_core0,
-                               "i2cSetup",
-                               8192,
-                               xTaskGetCurrentTaskHandle(),
-                               0,
-                               nullptr,
-                               0) != pdPASS)
-    {
-      ESP_LOGE(LOGNAME, "I2C setup task creation failed");
-    }
-#else
-    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
-                                             board_config::PIN_I2C_SDA,
-                                             board_config::PIN_I2C_SCL,
-                                             _i2c_addr,
-                                             xTaskGetCurrentTaskHandle(),
-                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
-    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
-             i2c_init_ok,
-             _i2c_addr,
-             board_config::PIN_I2C_SDA,
-             gpio_get_level(board_config::PIN_I2C_SDA),
-             board_config::PIN_I2C_SCL,
-             gpio_get_level(board_config::PIN_I2C_SCL));
-    if (!i2c_init_ok)
-    {
-      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
-    }
-#endif
   /*
     auto ms = lgfx::millis();
     lgfx::pinMode(0, lgfx::pin_mode_t::input_pullup);
@@ -883,6 +896,7 @@ namespace command_processor
           nvs_close(handle);
         }
         while (!lgfx::gpio_in(0) || !lgfx::gpio_in(1) || !lgfx::gpio_in(3)) lgfx::delay(10);
+        i2c_slave::shutdown();
         esp_restart();
       }
       taskYIELD();
@@ -1267,6 +1281,7 @@ namespace command_processor
          && (_params[0] == _params[3])
         )
         {
+          i2c_slave::shutdown();
           esp_restart();
           break;
         }
@@ -1603,7 +1618,9 @@ namespace command_processor
         std::size_t produced = 0;
         for (std::size_t i = 0; i < pixel_count; ++i)
         {
-          std::uint32_t res = _canvas.readPixelValue(_read_xptr, _read_yptr);
+          std::uint32_t res = _canvas_ready
+                            ? _canvas.readPixelValue(_read_xptr, _read_yptr)
+                            : 0;
           switch (bytes_per_pixel)
           {
             case 2: res = lgfx::color_convert<lgfx::swap565_t, lgfx::bgr888_t>(res); break;

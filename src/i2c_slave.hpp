@@ -32,6 +32,7 @@ namespace i2c_slave
   bool is_busy(void);
   void start_isr(void);
   void stop_isr(void);
+  void shutdown(void);
   void reset(void);
   // On the C61, resumes RX that was held after the main task processed one queue entry.
   // No-op on the original ESP32.
