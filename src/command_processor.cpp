@@ -6,6 +6,7 @@
 #include <driver/ledc.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <soc/soc_caps.h>
 #include <cstdlib>
 #include <cstring>
 
@@ -36,7 +37,26 @@ namespace command_processor
   static constexpr std::uint8_t I2C_MIN_ADDR = 0x08;
   static constexpr std::uint8_t I2C_MAX_ADDR = 0x77;
   static constexpr std::size_t RX_BUFFER_MAX = board_config::RX_QUEUE_CAPACITY;
+  static constexpr std::size_t ADVERTISED_FLOW_WINDOW = board_config::ADVERTISED_FLOW_WINDOW;
   static constexpr std::size_t PARAM_MAXLEN = 12;
+  static_assert((RX_BUFFER_MAX & (RX_BUFFER_MAX - 1)) == 0,
+                "RX queue capacity must remain a power of two for ring masks");
+  static_assert(ADVERTISED_FLOW_WINDOW <= RX_BUFFER_MAX,
+                "Advertised flow window must fit in the physical RX queue");
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+  // Reserve the FIFO worst case (32 one-byte commands) plus the current parser slot at
+  // the tail of the queue so a read address match under backpressure can parse the whole hardware RX FIFO.
+  static constexpr std::size_t RX_DRAIN_PARSER_SLOTS = 1;
+  static constexpr std::size_t RX_BACKPRESSURE_RESERVE = SOC_I2C_FIFO_LEN + 2;
+  static_assert(SOC_I2C_FIFO_LEN + RX_DRAIN_PARSER_SLOTS
+                  == RX_BACKPRESSURE_RESERVE - 1,
+                "Backpressure reserve must admit a worst-case FIFO drain");
+  static_assert(RX_BUFFER_MAX > RX_BACKPRESSURE_RESERVE,
+                "RX queue must reserve one hardware FIFO for read freshness");
+  static_assert(ADVERTISED_FLOW_WINDOW + RX_BACKPRESSURE_RESERVE
+                  >= RX_BUFFER_MAX + 4,
+                "Backpressure must begin before READ_BUFCOUNT clamps to one");
+#endif
 
 
   volatile std::size_t _rx_buffer_setpos = 0;
@@ -71,6 +91,11 @@ namespace command_processor
 
   /// Total commands dropped because the RX queue was full (incremented in the ISR, shown in diagnostics)
   volatile std::uint32_t _rx_dropped_count = 0;
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+  // Normally the transport stops RX at the high-water mark that reserves the whole hardware
+  // FIFO and the parser slot. Even if the queue does fill up, a completed command is never dropped.
+  volatile bool _rx_pending_enqueue = false;
+#endif
 
   static inline void mark_modified(void)
   {
@@ -670,6 +695,11 @@ namespace command_processor
     }
 
     _rx_buffer_getpos = (_rx_buffer_getpos + 1) & (RX_BUFFER_MAX - 1);
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // The C61 ISR stops the RX watermark at the queue high-water mark. Notify the transport
+    // right after freeing one entry so FIFO processing and SCL resume if they were held.
+    i2c_slave::resume_rx();
+#endif
     return true;
   }
 
@@ -837,7 +867,7 @@ namespace command_processor
     {
       last_diagnostic_interrupts = diagnostics.interrupts;
       ESP_LOGI(LOGNAME,
-               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u txcap=%u stretch(addr=%u tx=%u other=%u) cmd=0x%02x dropped=%u",
+               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u txcap=%u stretch(addr=%u tx=%u other=%u) backpressure(hold=%u timeout=%u) cmd=0x%02x dropped=%u",
                diagnostics.interrupts,
                diagnostics.last_status,
                diagnostics.rx_bytes,
@@ -847,6 +877,8 @@ namespace command_processor
                diagnostics.stretch_address,
                diagnostics.stretch_tx_empty,
                diagnostics.stretch_other,
+               diagnostics.rx_backpressure_holds,
+               diagnostics.rx_backpressure_timeouts,
                static_cast<unsigned>(_last_command),
                static_cast<unsigned>(_rx_dropped_count));
     }
@@ -886,6 +918,122 @@ namespace command_processor
     _param_index = 0;
     _param_need_count = 1;
     _param_resetindex = 0;
+  }
+
+  bool IRAM_ATTR rxNeedsBackpressure(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    if (_rx_pending_enqueue) return true;
+    const auto free_slots = (_rx_buffer_getpos - _rx_buffer_setpos) & (RX_BUFFER_MAX - 1);
+    // Under sustained backpressure a 1-byte read command still lands at the tail of the hardware FIFO.
+    // Stop at a reserve that lets the whole FIFO be parsed in order down to the reply command.
+    return free_slots != 0 && free_slots <= RX_BACKPRESSURE_RESERVE;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR rxCanDrainReadCommand(std::size_t rx_bytes)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    if (_rx_pending_enqueue) return false;
+    auto free_slots = (_rx_buffer_getpos - _rx_buffer_setpos) & (RX_BUFFER_MAX - 1);
+    if (free_slots == 0) free_slots = RX_BUFFER_MAX;
+    // Keep the current parser slot even in the worst case where every byte completes a command.
+    return free_slots > rx_bytes + RX_DRAIN_PARSER_SLOTS;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR rxCanCaptureReadCommand(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // The IAP payload arrives in a single write transaction; while in progress every byte goes
+    // to the current UPDATE_DATA. If a status read starts while the last byte is still in the
+    // FIFO at the high-water mark, leave it for the normal parser drain instead of taking it as a command.
+    // During sector_write the host reads without resending the command, so keep the latest
+    // UPDATE_DATA and return live status.
+    return _firmupdate_state != firmupdate_state_t::progress
+        && _firmupdate_state != firmupdate_state_t::sector_write;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR tryAcceptReadCommand(std::uint8_t value)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // While a completed command is parked in the parser slot, addData() must not overwrite
+    // its first byte. Hand the byte back to the deferred path of the transport.
+    if (_rx_pending_enqueue) return false;
+    switch (value)
+    {
+    case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+#if UNIT_LCD_HAS_ENCODER
+    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+#endif
+      // Apply the Sr of W->Sr->R as a parser boundary first, then complete only the 1-byte read
+      // command, which consumes no queue entry, through the normal addData path.
+      closeData();
+      addData(value);
+      return true;
+
+    default:
+      return false;
+    }
+#else
+    return false;
+#endif
+  }
+
+  static bool IRAM_ATTR enqueueCompletedCommand(void)
+  {
+    const auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
+    if (new_setpos == _rx_buffer_getpos)
+    {
+      return false;
+    }
+    _rx_buffer_setpos = new_setpos;
+    _param_index = _param_resetindex;
+    for (std::size_t i = 0; i < _param_resetindex; ++i)
+    {
+      _rx_buffer[new_setpos][i] = _params[i];
+    }
+    _params = _rx_buffer[new_setpos];
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    _rx_pending_enqueue = false;
+#endif
+    return true;
+  }
+
+  bool IRAM_ATTR retryPendingRxCommand(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    return !_rx_pending_enqueue || enqueueCompletedCommand();
+#else
+    return true;
+#endif
+  }
+
+  void IRAM_ATTR discardRxForBackpressureTimeout(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    _rx_dropped_count = _rx_dropped_count + 1;
+    if ((_param_index != 0 || _rx_pending_enqueue)
+     && _params[0] == lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR)
+    {
+      _nvs_push = false;
+    }
+    _rx_pending_enqueue = false;
+    closeData();
+#endif
   }
 
   /// I2CペリフェラルISRから1Byteずつデータを受取る処理
@@ -1028,8 +1176,11 @@ namespace command_processor
 
     if (_param_index >= _param_need_count)
     {
+#if defined(CONFIG_IDF_TARGET_ESP32)
+      // The original cannot wait on a read address match, so keep prefetching when the command completes.
       i2c_slave::clear_txdata();
       beginTxResponse();
+#endif
       switch (_params[0])
       {
       default:
@@ -1088,7 +1239,9 @@ namespace command_processor
           {
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BROKEN;
           }
+#if defined(CONFIG_IDF_TARGET_ESP32)
           i2c_slave::fill_txdata();
+#endif
           _firmupdate_state = sector_write;
           closeData();
         }
@@ -1162,28 +1315,36 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+#if defined(CONFIG_IDF_TARGET_ESP32)
         i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
       case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
+#if defined(CONFIG_IDF_TARGET_ESP32)
         i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
 #if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
         encoder_input::read_state(_encoder_state_response);
+#if defined(CONFIG_IDF_TARGET_ESP32)
         beginTxResponse();
         i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
       case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
         encoder_input::peek_event(_encoder_event_response);
+#if defined(CONFIG_IDF_TARGET_ESP32)
         beginTxResponse();
         i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
@@ -1199,8 +1360,10 @@ namespace command_processor
 
       case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
         encoder_input::read_button_config(_button_config_response);
+#if defined(CONFIG_IDF_TARGET_ESP32)
         beginTxResponse();
         i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
@@ -1211,18 +1374,19 @@ namespace command_processor
 #endif
       }
 
-      /// Queue insertion. When full (effective capacity RX_BUFFER_MAX - 1) the new command is dropped.
-      /// Old commands are kept because drawing is order dependent and cumulative: stopping
-      /// after command N is self-consistent, whereas dropping old commands loses base fills
-      /// and window setup so later commands land on the wrong background. Previously setpos
-      /// advanced without checking for space, so the moment it overtook getpos the queue read
-      /// as empty and every pending command vanished.
-      /// Future: the ESP32-C61 can read the slave clock-stretch cause, so this branch could
-      /// change from dropping to stretching the clock to hold the host.
-      /// (The original ESP32 lacks SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE, so it can only drop.)
-      auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
-      if (new_setpos == _rx_buffer_getpos)
+      /// Queue insertion. The C61 stops the transport at a high-water mark that leaves room for
+      /// the whole FIFO and the parser slot, so the queue normally never fills. If it does, the
+      /// completed command is parked until main frees an entry. The original ESP32 cannot
+      /// stretch on address match, so it drops the new command as before. Old commands are kept
+      /// because drawing is order dependent and stopping after command N is self-consistent.
+      if (!enqueueCompletedCommand())
       {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+        // Normally unreachable thanks to the reserved slots. Even when completely full, keep the
+        // completed command in the parser slot and hold the transport until main frees an entry.
+        _rx_pending_enqueue = true;
+        return _nvs_push ? false : true;
+#else
         _rx_dropped_count = _rx_dropped_count + 1;
         if (_params[0] == lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR)
         {
@@ -1234,14 +1398,8 @@ namespace command_processor
         /// (_param_resetindex bytes) is still in the current slot, so no copy is needed.
         _param_index = _param_resetindex;
         return false;
+#endif
       }
-      _rx_buffer_setpos = new_setpos;
-      _param_index = _param_resetindex;
-      for (std::size_t i = 0; i < _param_resetindex; ++i)
-      {
-        _rx_buffer[new_setpos][i] = _params[i];
-      }
-      _params = _rx_buffer[new_setpos];
 
 
       // NVS領域やファームウェアへの書き込みはタスク通知を使うとクラッシュするのでfalseを返す
@@ -1288,6 +1446,10 @@ namespace command_processor
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
       _tx_response_length = 0;
+      // Sections 3.3/12 define pixel continuity within a single read transaction, with the
+      // read pointer starting at the top-left of the window. The released host readRect() also
+      // reads everything in one readBytes, so on the C61 the cursor is deliberately returned to
+      // the window start on every address match; it does not continue across plain reads.
       _read_xptr = _read_xs;
       _read_yptr = _read_ys;
       break;
@@ -1322,12 +1484,25 @@ namespace command_processor
           std::int32_t gp = _rx_buffer_getpos;
           if (sp != gp)
           {
-            //std::int32_t buf_free = ((int)(getBufferFree() + 512) - rxbuffer_max) >> 1;
+            // READ_BUFCOUNT advertises free space of the 512-entry window shared with the
+            // released host in units of 2 entries, not the whole physical queue. The 0..255
+            // semantics seen by the host stay the same even though queue sizes differ per target.
             std::int32_t buf_free = gp - sp;
             if (buf_free > 0) buf_free -= RX_BUFFER_MAX;
             //
-            buf_free = (buf_free + 512) >> 1;
-            res = std::max<std::int32_t>(1, std::min<std::int32_t>(254, buf_free));
+            buf_free = (buf_free + ADVERTISED_FLOW_WINDOW) >> 1;
+            if (buf_free < 1)
+            {
+              res = 1;
+            }
+            else if (buf_free > 254)
+            {
+              res = 254;
+            }
+            else
+            {
+              res = static_cast<std::uint32_t>(buf_free);
+            }
           }
         }
         destination[0] = static_cast<std::uint8_t>(res);
@@ -1339,7 +1514,8 @@ namespace command_processor
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
       {
         const std::size_t bytes_per_pixel = _tx_response_command & 3;
-        const std::size_t pixel_count = std::min<std::size_t>(8, capacity / bytes_per_pixel);
+        const std::size_t available_pixels = capacity / bytes_per_pixel;
+        const std::size_t pixel_count = available_pixels < 8 ? available_pixels : 8;
         std::size_t produced = 0;
         for (std::size_t i = 0; i < pixel_count; ++i)
         {
@@ -1377,7 +1553,8 @@ namespace command_processor
       {
         if (_tx_response_length == 0) return 0;
         if (_tx_response_cursor == _tx_response_length) _tx_response_cursor = 0;
-        const auto produced = std::min(capacity, _tx_response_length - _tx_response_cursor);
+        const auto remaining = _tx_response_length - _tx_response_cursor;
+        const auto produced = capacity < remaining ? capacity : remaining;
         memcpy(destination, _tx_response_snapshot + _tx_response_cursor, produced);
         _tx_response_cursor += produced;
         return produced;

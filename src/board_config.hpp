@@ -48,7 +48,10 @@ namespace board_config
   static constexpr std::uint16_t CPU_POWER_MAX_MHZ[] = { 40, 160, 160 };
   static constexpr std::uint16_t IDLE_POLL_INTERVAL_MS = 1;
   static constexpr std::uint8_t DEFAULT_FIRMWARE_MINOR = 5;
-  static constexpr std::size_t RX_QUEUE_CAPACITY = 0x2000;
+  // The C61 clock-stretches at the queue high-water mark, so a queue deeper than the
+  // 512-entry flow-control window the host uses is unnecessary. Returning static DRAM
+  // to the heap guarantees a contiguous stack for the OTA task.
+  static constexpr std::size_t RX_QUEUE_CAPACITY = 0x0200;
 #else
   // Wiring and operating conditions of the shipped original Unit LCD (ESP32-PICO-D4).
   static constexpr gpio_num_t PIN_I2C_SDA = GPIO_NUM_21;
@@ -83,6 +86,9 @@ namespace board_config
 #endif
 
   static constexpr bool HAS_ENCODER = UNIT_LCD_HAS_ENCODER;
+  // The window advertised by READ_BUFCOUNT is a host protocol contract independent of the physical queue size.
+  // Both the deep queue of the original and the 512-entry queue of the C61 return the same 0..255.
+  static constexpr std::size_t ADVERTISED_FLOW_WINDOW = 0x0200;
 
   static constexpr std::uint16_t LCD_WIDTH = 135;
   static constexpr std::uint16_t LCD_HEIGHT = 240;
