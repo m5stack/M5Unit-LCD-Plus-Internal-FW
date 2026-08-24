@@ -1,6 +1,11 @@
 
 #include "update.hpp"
+#include "board_config.hpp"
 #include "common.hpp"
+
+#if UNIT_LCD_HAS_ENCODER
+#include "encoder_input.hpp"
+#endif
 
 //#include <Update.h>
 #include <esp_partition.h>
@@ -99,9 +104,20 @@ namespace update
   static void writeTask(void* args)
   {
     auto info = (write_info_t*)args;
-    if ((!info->finish && (ESP_OK != esp_partition_erase_range(_partition, info->offset, BLOCK_SIZE)))
-     || (ESP_OK != esp_partition_write(_partition, info->offset, info->buffer, info->len))
-     || (info->finish && (ESP_OK != esp_ota_set_boot_partition(_partition))))
+    bool write_failed = false;
+    {
+#if UNIT_LCD_HAS_ENCODER
+      // IDF masks the non-IRAM ISR while the cache is off, but wrap only erase/write/boot-partition
+      // updates in the shared guard for the boundary drain and deterministic re-anchor. Guarding
+      // the whole IAP session would leave the encoder dead until reboot if the session is aborted.
+      encoder_input::flash_guard_t encoder_flash_guard;
+#endif
+      write_failed =
+          (!info->finish && (ESP_OK != esp_partition_erase_range(_partition, info->offset, BLOCK_SIZE)))
+       || (ESP_OK != esp_partition_write(_partition, info->offset, info->buffer, info->len))
+       || (info->finish && (ESP_OK != esp_ota_set_boot_partition(_partition)));
+    }
+    if (write_failed)
     {
       info->status = write_info_t::status_t::error;
     }

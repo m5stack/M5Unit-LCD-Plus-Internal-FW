@@ -23,9 +23,16 @@ namespace encoder_input
   {
     using namespace unit_lcd_plus_protocol;
 
-    constexpr std::uint32_t POLLING_INTERVAL_US = 1000;
+    constexpr std::uint32_t BUTTON_POLLING_INTERVAL_US = 1000;
     constexpr std::uint16_t BUTTON_DEBOUNCE_SAMPLES = 10;
     constexpr std::uint8_t BUTTON_PRESSED_LEVEL = 0;
+    // Enum constants have no storage and fold into immediates, so the GPIO ISR never
+    // reads a valid-state table in flash. Bit n means transition code n qualifies.
+    enum : std::uint16_t
+    {
+      ENCODER_VALID_TRANSITIONS = 0x6996,     // 0x1, 0x2, 0x4, 0x7, 0x8, 0xB, 0xD, 0xE
+      ENCODER_CLOCKWISE_TRANSITIONS = 0x2814, // 0x2, 0x4, 0xB, 0xD
+    };
 
     struct event_t
     {
@@ -45,7 +52,7 @@ namespace encoder_input
     std::uint16_t dropped_count = 0;
     std::int32_t position = 0;
     std::uint8_t encoder_code = 0;
-    std::uint16_t encoder_store = 0;
+    std::int8_t encoder_phase = 0;
     bool button_pressed = false;
     bool button_long_pressed = false;
     bool button_candidate_pressed = false;
@@ -56,6 +63,7 @@ namespace encoder_input
     std::uint16_t click_window_samples = 0;
     bool single_click_pending = false;
     bool second_click_pressed = false;
+    bool encoder_interrupts_ready = false;
 
     std::uint8_t IRAM_ATTR state_flags_locked()
     {
@@ -171,32 +179,83 @@ namespace encoder_input
 
     void IRAM_ATTR sample_encoder_locked()
     {
-      static constexpr std::uint8_t valid_states[16] = {
-        0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0
-      };
-
       encoder_code = static_cast<std::uint8_t>((encoder_code << 2)
                     | gpio_get_level(board_config::PIN_ENCODER_A)
                     | (gpio_get_level(board_config::PIN_ENCODER_B) << 1));
       encoder_code &= 0x0F;
-      if (!valid_states[encoder_code]) return;
+      if (!(ENCODER_VALID_TRANSITIONS & (1U << encoder_code)))
+      {
+        // A re-sample of the same state keeps the partial phase. A diagonal transition has no
+        // determinable direction, so drop it and never join distant valid transitions.
+        if ((encoder_code >> 2) != (encoder_code & 3)) encoder_phase = 0;
+        return;
+      }
 
-      encoder_store = static_cast<std::uint16_t>((encoder_store << 4) | encoder_code);
+      // One mechanical detent is two Gray-code transitions (half a cycle). The previous code
+      // matched a full four-transition cycle, so two detents gave +/-1 and the unresolved
+      // half cycle at a reversal was cancelled by the next opposite transition without an event.
+      // Accumulate every valid transition as a signed phase and confirm one detent at +/-2.
+      // A reversed transition subtracts from the same phase, so net displacement is preserved regardless of path.
+      // A single-transition bounce between adjacent states cancels on the way back, and diagonal
+      // invalid transitions reset the phase above. Two consecutive valid transitions in the same
+      // direction are indistinguishable from a real detent, so count them as one and add no time filter.
+      // Even if contact bounce fires the GPIO ISR repeatedly, a round trip to the adjacent state
+      // adds with opposite signs and cancels. No waiting, loops or logging inside the ISR.
+      // The transition observed for clockwise rotation on hardware (0x2 -> 0xB) is the positive direction.
+      // This matches the existing M5Stack convention of clockwise = increase while keeping the
+      // A/B pin names and the invalid-transition check: only the sign table is defined, the GPIOs are not swapped.
+      encoder_phase += (ENCODER_CLOCKWISE_TRANSITIONS & (1U << encoder_code)) ? 1 : -1;
+
       std::int16_t delta = 0;
-      if (encoder_store == 0xE817 || encoder_store == 0x17E8) delta = 1;
-      if (encoder_store == 0xD42B || encoder_store == 0x2BD4) delta = -1;
+      if (encoder_phase >= 2)
+      {
+        encoder_phase -= 2;
+        delta = 1;
+      }
+      else if (encoder_phase <= -2)
+      {
+        encoder_phase += 2;
+        delta = -1;
+      }
       if (delta == 0) return;
 
-      encoder_store = 0;
       position = saturated_add(position, delta);
       push_event_locked(ENCODER_EVENT_ROTATE, delta);
+    }
+
+    void IRAM_ATTR encoder_gpio_isr(void*)
+    {
+      portENTER_CRITICAL_ISR(&lock);
+      sample_encoder_locked();
+      portEXIT_CRITICAL_ISR(&lock);
+    }
+
+    bool setup_encoder_interrupts()
+    {
+      // IDF masks the non-IRAM ISR while the cache is off. The explicit guard does not rely on
+      // that mask; it exists to drain and re-anchor at the boundaries of flash operations.
+      auto result = gpio_install_isr_service(0);
+      if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) return false;
+      result = gpio_set_intr_type(board_config::PIN_ENCODER_A, GPIO_INTR_ANYEDGE);
+      if (result != ESP_OK) return false;
+      result = gpio_set_intr_type(board_config::PIN_ENCODER_B, GPIO_INTR_ANYEDGE);
+      if (result != ESP_OK) return false;
+      result = gpio_isr_handler_add(board_config::PIN_ENCODER_A, encoder_gpio_isr, nullptr);
+      if (result != ESP_OK) return false;
+      result = gpio_isr_handler_add(board_config::PIN_ENCODER_B, encoder_gpio_isr, nullptr);
+      if (result != ESP_OK)
+      {
+        gpio_isr_handler_remove(board_config::PIN_ENCODER_A);
+        return false;
+      }
+      encoder_interrupts_ready = true;
+      return true;
     }
 
     void timer_callback(void*)
     {
       portENTER_CRITICAL(&lock);
       sample_button_locked();
-      sample_encoder_locked();
       portEXIT_CRITICAL(&lock);
     }
   }
@@ -217,6 +276,7 @@ namespace encoder_input
     encoder_code = static_cast<std::uint8_t>(gpio_get_level(board_config::PIN_ENCODER_A)
                    | (gpio_get_level(board_config::PIN_ENCODER_B) << 1));
     button_candidate_pressed = gpio_get_level(board_config::PIN_ENCODER_BUTTON) == BUTTON_PRESSED_LEVEL;
+    const bool encoder_interrupt_init_ok = setup_encoder_interrupts();
 
     const esp_timer_create_args_t timer_args = {
       .callback = timer_callback,
@@ -225,8 +285,44 @@ namespace encoder_input
       .name = "unit_lcd_encoder",
       .skip_unhandled_events = true,
     };
-    return esp_timer_create(&timer_args, &timer) == ESP_OK
-        && esp_timer_start_periodic(timer, POLLING_INTERVAL_US) == ESP_OK;
+    const bool timer_init_ok = esp_timer_create(&timer_args, &timer) == ESP_OK
+                            && esp_timer_start_periodic(timer, BUTTON_POLLING_INTERVAL_US) == ESP_OK;
+    return encoder_interrupt_init_ok && timer_init_ok;
+  }
+
+  flash_guard_t::flash_guard_t()
+  {
+    suspend_for_flash_write();
+  }
+
+  flash_guard_t::~flash_guard_t()
+  {
+    resume_after_flash_write();
+  }
+
+  void suspend_for_flash_write(void)
+  {
+    if (!encoder_interrupts_ready) return;
+    gpio_intr_disable(board_config::PIN_ENCODER_A);
+    gpio_intr_disable(board_config::PIN_ENCODER_B);
+    // Wait until an ISR that started before the disable releases the lock, so no encoder
+    // handler is still running when the flash-off window begins.
+    portENTER_CRITICAL(&lock);
+    portEXIT_CRITICAL(&lock);
+  }
+
+  void resume_after_flash_write(void)
+  {
+    if (!encoder_interrupts_ready) return;
+    portENTER_CRITICAL(&lock);
+    // The order of transitions during the stop cannot be recovered. Joining the pre-stop phase
+    // with the resumed state could create a detent in the wrong direction, so drop the phase and restart from the current state.
+    encoder_code = static_cast<std::uint8_t>(gpio_get_level(board_config::PIN_ENCODER_A)
+                   | (gpio_get_level(board_config::PIN_ENCODER_B) << 1));
+    encoder_phase = 0;
+    portEXIT_CRITICAL(&lock);
+    gpio_intr_enable(board_config::PIN_ENCODER_A);
+    gpio_intr_enable(board_config::PIN_ENCODER_B);
   }
 
   void read_state(std::uint8_t* response)

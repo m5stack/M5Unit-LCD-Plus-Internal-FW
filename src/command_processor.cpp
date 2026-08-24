@@ -298,13 +298,21 @@ namespace command_processor
 // lgfx::gpio_hi(0);
 // #endif
 
-    std::uint32_t handle = 0;
-    bool result = (ESP_OK == nvs_open(LOGNAME, NVS_READWRITE, &handle));
-    if (result)
+    bool result = false;
     {
-      result = (ESP_OK == nvs_set_u8(handle, NVS_KEY_I2CADDR, addr))
-            && (ESP_OK == nvs_commit(handle));
-      nvs_close(handle);
+#if UNIT_LCD_HAS_ENCODER
+      // An NVS commit also disables the cache. Drain the running ISR with the shared guard and
+      // re-anchor to the GPIO state afterwards so transitions before and after are not joined wrongly.
+      encoder_input::flash_guard_t encoder_flash_guard;
+#endif
+      std::uint32_t handle = 0;
+      result = (ESP_OK == nvs_open(LOGNAME, NVS_READWRITE, &handle));
+      if (result)
+      {
+        result = (ESP_OK == nvs_set_u8(handle, NVS_KEY_I2CADDR, addr))
+              && (ESP_OK == nvs_commit(handle));
+        nvs_close(handle);
+      }
     }
     i2c_slave::start_isr();
 
