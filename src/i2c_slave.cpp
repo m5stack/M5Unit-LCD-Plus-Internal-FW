@@ -2,8 +2,10 @@
 //! Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
+#include <esp_attr.h>
 #include <driver/gpio.h>
 #include <esp_intr_alloc.h>
 #include <esp_private/periph_ctrl.h>
@@ -26,6 +28,9 @@ namespace i2c_slave
     // so a 1-byte read command is handled before the repeated START.
     constexpr std::uint32_t RX_FIFO_FULL_THRESHOLD = 1;
     constexpr std::uint32_t TX_FIFO_EMPTY_THRESHOLD = 2;
+    constexpr std::size_t TX_STAGING_CAPACITY = 32;
+    static_assert(SOC_I2C_FIFO_LEN == TX_STAGING_CAPACITY,
+                  "I2C TX staging must match the hardware FIFO");
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
     // C61 encodes this as an exponent: timeout period = 2^value source clocks.
     constexpr std::uint32_t SLAVE_TIMEOUT = 22;
@@ -69,9 +74,11 @@ namespace i2c_slave
     volatile std::uint32_t diagnostic_rx_bytes = 0;
     volatile std::uint32_t diagnostic_tx_fifo_events = 0;
     volatile std::uint32_t diagnostic_tx_bytes = 0;
+    volatile std::uint32_t diagnostic_tx_capacity_violations = 0;
     volatile std::uint32_t diagnostic_stretch_address = 0;
     volatile std::uint32_t diagnostic_stretch_tx_empty = 0;
     volatile std::uint32_t diagnostic_stretch_other = 0;
+    DRAM_ATTR std::uint8_t tx_staging_buffer[TX_STAGING_CAPACITY];
 
     i2c_dev_t* hardware()
     {
@@ -175,9 +182,8 @@ namespace i2c_slave
       }
 
       // The reply must not be rebuilt here after RX. When the command completed,
-      // command_processor already ran clear_txdata() + prepareTxData(), and for
-      // READ_RAW prepareTxData() advances the read pointer by 8 pixels, so a second
-      // preparation drops the first 8 pixels and replies from the ninth.
+      // command_processor already ran beginTxResponse() and this transport fill_txdata(),
+      // so re-initializing would return the READ_RAW cursor to the start.
       // Windows of 1/2/4/8 pixels wrap around and hide the defect.
 
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
@@ -188,7 +194,7 @@ namespace i2c_slave
 #endif
       {
         ++diagnostic_tx_fifo_events;
-        command_processor::prepareTxData();
+        fill_txdata();
       }
 
       if (interrupt_status & (COMPLETE_INTERRUPT | START_INTERRUPT
@@ -212,13 +218,13 @@ namespace i2c_slave
           i2c_ll_get_txfifo_len(device, &tx_available);
           if (tx_available == SOC_I2C_FIFO_LEN)
           {
-            command_processor::prepareTxData();
+            fill_txdata();
           }
         }
         else if (stretch_cause == I2C_SLAVE_STRETCH_CAUSE_TX_EMPTY)
         {
           ++diagnostic_stretch_tx_empty;
-          command_processor::prepareTxData();
+          fill_txdata();
         }
         else
         {
@@ -252,30 +258,27 @@ namespace i2c_slave
     i2c_ll_txfifo_rst(device);
   }
 
-  void IRAM_ATTR add_txdata(const std::uint8_t* buffer, std::size_t length)
+  void IRAM_ATTR fill_txdata(void)
   {
     auto* device = hardware();
-#if defined(CONFIG_IDF_TARGET_ESP32C61)
     std::uint32_t available = 0;
     i2c_ll_get_txfifo_len(device, &available);
-    const auto write_length = static_cast<std::uint8_t>(std::min<std::size_t>(length, available));
-#else
-    // The original ESP32 refills at most 24 bytes at TX empty threshold=2, so everything fits.
-    // No silent truncation; push the same number of bytes into the FIFO as the shipped firmware.
-    const auto write_length = static_cast<std::uint8_t>(length);
-#endif
-    if (write_length != 0)
+    const auto capacity = std::min<std::size_t>(available, TX_STAGING_CAPACITY);
+    const auto produced = command_processor::produceTx(tx_staging_buffer, capacity);
+
+    // If the producer violates the capacity contract, hold the whole reply instead of writing part of it.
+    // Normally the whole produced amount is transferred in one FIFO write.
+    if (produced > capacity)
     {
-      i2c_ll_write_txfifo(device, buffer, write_length);
-      diagnostic_tx_bytes += write_length;
+      diagnostic_tx_capacity_violations = diagnostic_tx_capacity_violations + 1;
+    }
+    else if (produced != 0)
+    {
+      i2c_ll_write_txfifo(device, tx_staging_buffer, static_cast<std::uint8_t>(produced));
+      diagnostic_tx_bytes += produced;
     }
     i2c_ll_clear_intr_mask(device, TX_INTERRUPT);
     i2c_ll_slave_enable_tx_it(device);
-  }
-
-  void IRAM_ATTR add_txdata(std::uint8_t value)
-  {
-    add_txdata(&value, 1);
   }
 
   void IRAM_ATTR start_isr(void)
@@ -346,6 +349,7 @@ namespace i2c_slave
     diagnostics->rx_bytes = diagnostic_rx_bytes;
     diagnostics->tx_fifo_events = diagnostic_tx_fifo_events;
     diagnostics->tx_bytes = diagnostic_tx_bytes;
+    diagnostics->tx_capacity_violations = diagnostic_tx_capacity_violations;
     diagnostics->stretch_address = diagnostic_stretch_address;
     diagnostics->stretch_tx_empty = diagnostic_stretch_tx_empty;
     diagnostics->stretch_other = diagnostic_stretch_other;

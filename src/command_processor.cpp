@@ -69,6 +69,9 @@ namespace command_processor
 
   bool _nvs_push = false;
 
+  /// Total commands dropped because the RX queue was full (incremented in the ISR, shown in diagnostics)
+  volatile std::uint32_t _rx_dropped_count = 0;
+
   static inline void mark_modified(void)
   {
     _modified = true;
@@ -136,6 +139,21 @@ namespace command_processor
   std::size_t _firmupdate_totalsize = 0;
   std::size_t _firmupdate_result = 0;
   std::size_t _last_command = 0;
+  static constexpr std::size_t TX_RESPONSE_SNAPSHOT_CAPACITY = 10;
+  static_assert(sizeof(read_id_data) <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "READ_ID response must fit in the TX snapshot");
+#if UNIT_LCD_HAS_ENCODER
+  static_assert(unit_lcd_plus_protocol::ENCODER_STATE_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "encoder state response must fit in the TX snapshot");
+  static_assert(unit_lcd_plus_protocol::ENCODER_EVENT_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "encoder event response must fit in the TX snapshot");
+  static_assert(unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "button config response must fit in the TX snapshot");
+#endif
+  std::uint8_t _tx_response_snapshot[TX_RESPONSE_SNAPSHOT_CAPACITY] = { 0xff };
+  std::size_t _tx_response_length = 1;
+  std::size_t _tx_response_cursor = 0;
+  std::uint8_t _tx_response_command = lgfx::Panel_M5UnitLCD::CMD_NOP;
 #if UNIT_LCD_HAS_ENCODER
   std::uint8_t _encoder_state_response[unit_lcd_plus_protocol::ENCODER_STATE_SIZE] = {};
   std::uint8_t _encoder_event_response[unit_lcd_plus_protocol::ENCODER_EVENT_SIZE] = {};
@@ -630,7 +648,6 @@ namespace command_processor
       {
         _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_OK;
       }
-
       _firmupdate_state = firmupdate_state_t::wait_data;
       _firmupdate_index += update::BLOCK_SIZE;
       _lcd.fillCircle( 10 + (_lcd.width() - 20) * _firmupdate_index / _firmupdate_totalsize, 120, 4, TFT_GREEN );
@@ -820,16 +837,18 @@ namespace command_processor
     {
       last_diagnostic_interrupts = diagnostics.interrupts;
       ESP_LOGI(LOGNAME,
-               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u stretch(addr=%u tx=%u other=%u) cmd=0x%02x",
+               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u txcap=%u stretch(addr=%u tx=%u other=%u) cmd=0x%02x dropped=%u",
                diagnostics.interrupts,
                diagnostics.last_status,
                diagnostics.rx_bytes,
                diagnostics.tx_fifo_events,
                diagnostics.tx_bytes,
+               diagnostics.tx_capacity_violations,
                diagnostics.stretch_address,
                diagnostics.stretch_tx_empty,
                diagnostics.stretch_other,
-               static_cast<unsigned>(_last_command));
+               static_cast<unsigned>(_last_command),
+               static_cast<unsigned>(_rx_dropped_count));
     }
     bool processed_command = false;
     while (command())
@@ -1010,6 +1029,7 @@ namespace command_processor
     if (_param_index >= _param_need_count)
     {
       i2c_slave::clear_txdata();
+      beginTxResponse();
       switch (_params[0])
       {
       default:
@@ -1068,7 +1088,7 @@ namespace command_processor
           {
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BROKEN;
           }
-          prepareTxData();
+          i2c_slave::fill_txdata();
           _firmupdate_state = sector_write;
           closeData();
         }
@@ -1142,28 +1162,28 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
-        _read_xptr = _read_xs;
-        _read_yptr = _read_ys;
-        prepareTxData();
+        i2c_slave::fill_txdata();
         closeData();
         return false;
 
       case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
-        prepareTxData();
+        i2c_slave::fill_txdata();
         closeData();
         return false;
 
 #if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
         encoder_input::read_state(_encoder_state_response);
-        prepareTxData();
+        beginTxResponse();
+        i2c_slave::fill_txdata();
         closeData();
         return false;
 
       case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
         encoder_input::peek_event(_encoder_event_response);
-        prepareTxData();
+        beginTxResponse();
+        i2c_slave::fill_txdata();
         closeData();
         return false;
 
@@ -1179,7 +1199,8 @@ namespace command_processor
 
       case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
         encoder_input::read_button_config(_button_config_response);
-        prepareTxData();
+        beginTxResponse();
+        i2c_slave::fill_txdata();
         closeData();
         return false;
 
@@ -1190,7 +1211,30 @@ namespace command_processor
 #endif
       }
 
+      /// Queue insertion. When full (effective capacity RX_BUFFER_MAX - 1) the new command is dropped.
+      /// Old commands are kept because drawing is order dependent and cumulative: stopping
+      /// after command N is self-consistent, whereas dropping old commands loses base fills
+      /// and window setup so later commands land on the wrong background. Previously setpos
+      /// advanced without checking for space, so the moment it overtook getpos the queue read
+      /// as empty and every pending command vanished.
+      /// Future: the ESP32-C61 can read the slave clock-stretch cause, so this branch could
+      /// change from dropping to stretching the clock to hold the host.
+      /// (The original ESP32 lacks SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE, so it can only drop.)
       auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
+      if (new_setpos == _rx_buffer_getpos)
+      {
+        _rx_dropped_count = _rx_dropped_count + 1;
+        if (_params[0] == lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR)
+        {
+          /// Leaving _nvs_push set for a dropped CHANGE_ADDR would keep READ_BUFCOUNT stuck
+          /// at 1, so forget the request entirely
+          _nvs_push = false;
+        }
+        /// The parser continues in the current slot. The prefix of a variable-length command
+        /// (_param_resetindex bytes) is still in the current slot, so no copy is needed.
+        _param_index = _param_resetindex;
+        return false;
+      }
       _rx_buffer_setpos = new_setpos;
       _param_index = _param_resetindex;
       for (std::size_t i = 0; i < _param_resetindex; ++i)
@@ -1206,23 +1250,64 @@ namespace command_processor
     return false;
   }
 
-  void IRAM_ATTR prepareTxData(void)
+  void IRAM_ATTR beginTxResponse(void)
   {
-    /// Kept in DRAM because the ISR reads it (same reason as read_id_data).
-    static const DRAM_ATTR std::uint8_t dummy[] = { 0xff, 0xff };
-    switch (_last_command)
+    _tx_response_command = static_cast<std::uint8_t>(_last_command);
+    _tx_response_cursor = 0;
+    _tx_response_length = 1;
+    _tx_response_snapshot[0] = 0xff;
+
+    switch (_tx_response_command)
     {
     default:
-      i2c_slave::add_txdata(dummy, 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
-      i2c_slave::add_txdata(read_id_data, sizeof(read_id_data));
+      _tx_response_length = sizeof(read_id_data);
+      memcpy(_tx_response_snapshot, read_id_data, _tx_response_length);
       break;
 
-    case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
-      i2c_slave::add_txdata(_firmupdate_result);
+#if UNIT_LCD_HAS_ENCODER
+    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+      _tx_response_length = sizeof(_encoder_state_response);
+      memcpy(_tx_response_snapshot, _encoder_state_response, _tx_response_length);
       break;
+
+    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+      _tx_response_length = sizeof(_encoder_event_response);
+      memcpy(_tx_response_snapshot, _encoder_event_response, _tx_response_length);
+      break;
+
+    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+      _tx_response_length = sizeof(_button_config_response);
+      memcpy(_tx_response_snapshot, _button_config_response, _tx_response_length);
+      break;
+#endif
+
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+      _tx_response_length = 0;
+      _read_xptr = _read_xs;
+      _read_yptr = _read_ys;
+      break;
+    }
+  }
+
+  std::size_t IRAM_ATTR produceTx(std::uint8_t* destination, std::size_t capacity)
+  {
+    if (destination == nullptr || capacity == 0)
+    {
+      return 0;
+    }
+
+    switch (_tx_response_command)
+    {
+    // The released host sends the command once and then repeats plain reads waiting for the
+    // value to change, so these two replies are re-evaluated on every refill instead of snapshotted at begin.
+    case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
+      destination[0] = static_cast<std::uint8_t>(_firmupdate_result);
+      return 1;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
       {
@@ -1240,62 +1325,63 @@ namespace command_processor
             //std::int32_t buf_free = ((int)(getBufferFree() + 512) - rxbuffer_max) >> 1;
             std::int32_t buf_free = gp - sp;
             if (buf_free > 0) buf_free -= RX_BUFFER_MAX;
-            // 
+            //
             buf_free = (buf_free + 512) >> 1;
             res = std::max<std::int32_t>(1, std::min<std::int32_t>(254, buf_free));
           }
         }
-        i2c_slave::add_txdata((std::uint8_t*)&res, 1);
+        destination[0] = static_cast<std::uint8_t>(res);
+        return 1;
       }
-      break;
-
-#if UNIT_LCD_HAS_ENCODER
-    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
-      i2c_slave::add_txdata(_encoder_state_response, sizeof(_encoder_state_response));
-      break;
-
-    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
-      i2c_slave::add_txdata(_encoder_event_response, sizeof(_encoder_event_response));
-      break;
-
-    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
-      i2c_slave::add_txdata(_button_config_response, sizeof(_button_config_response));
-      break;
-#endif
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
-      for (std::size_t i = 0; i < 8; ++i)
       {
-        std::uint32_t res = _canvas.readPixelValue(_read_xptr, _read_yptr);
-        std::size_t bytes = _last_command & 3;
-        switch (bytes)
+        const std::size_t bytes_per_pixel = _tx_response_command & 3;
+        const std::size_t pixel_count = std::min<std::size_t>(8, capacity / bytes_per_pixel);
+        std::size_t produced = 0;
+        for (std::size_t i = 0; i < pixel_count; ++i)
         {
-          case 2: res = lgfx::color_convert<lgfx::swap565_t, lgfx::bgr888_t>(res); break;
-          case 1: res = lgfx::color_convert<lgfx::rgb332_t, lgfx::bgr888_t>(res); break;
-          default: break;
-        }
-        if (_byteswap)
-        {
-          switch (bytes)
+          std::uint32_t res = _canvas.readPixelValue(_read_xptr, _read_yptr);
+          switch (bytes_per_pixel)
           {
-            case 3: res = lgfx::getSwap24(res); break;
-            case 2: res = lgfx::getSwap16(res); break;
+            case 2: res = lgfx::color_convert<lgfx::swap565_t, lgfx::bgr888_t>(res); break;
+            case 1: res = lgfx::color_convert<lgfx::rgb332_t, lgfx::bgr888_t>(res); break;
             default: break;
           }
-        }
-        i2c_slave::add_txdata((std::uint8_t*)&res, bytes);
-        if (++_read_xptr > _read_xe)
-        {
-          _read_xptr = _read_xs;
-          if (++_read_yptr > _read_ye)
+          if (_byteswap)
           {
-            _read_yptr = _read_ys;
+            switch (bytes_per_pixel)
+            {
+              case 3: res = lgfx::getSwap24(res); break;
+              case 2: res = lgfx::getSwap16(res); break;
+              default: break;
+            }
+          }
+          memcpy(destination + produced, &res, bytes_per_pixel);
+          produced += bytes_per_pixel;
+          if (++_read_xptr > _read_xe)
+          {
+            _read_xptr = _read_xs;
+            if (++_read_yptr > _read_ye)
+            {
+              _read_yptr = _read_ys;
+            }
           }
         }
+        return produced;
       }
-      break;
+
+    default:
+      {
+        if (_tx_response_length == 0) return 0;
+        if (_tx_response_cursor == _tx_response_length) _tx_response_cursor = 0;
+        const auto produced = std::min(capacity, _tx_response_length - _tx_response_cursor);
+        memcpy(destination, _tx_response_snapshot + _tx_response_cursor, produced);
+        _tx_response_cursor += produced;
+        return produced;
+      }
     }
   }
 }

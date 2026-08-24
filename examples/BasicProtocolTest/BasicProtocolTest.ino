@@ -10,6 +10,7 @@
 //! Destructive or risky items (abandoned IAP / invalid CHANGE_ADDR / UPDATE_END magic)
 //! never run automatically; they require an explicit serial trigger ('6' / '7' / '8').
 //! Their risks and recovery steps are documented in each function and printed at run time.
+//! The READ_BUFCOUNT liveness test takes about 6 seconds and is also triggered explicitly with '9'.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -26,6 +27,7 @@ namespace
   // Command codes follow docs/Unit_LCD_Plus_I2C_Protocol_zh.md section 5 (command summary)
   constexpr uint8_t CMD_READ_ID       = 0x04;
   constexpr uint8_t CMD_READ_BUFCOUNT = 0x09;
+  constexpr uint8_t CMD_COPYRECT      = 0x23;
   constexpr uint8_t CMD_CASET         = 0x2A;
   constexpr uint8_t CMD_RASET         = 0x2B;
   constexpr uint8_t CMD_WRITE_RAW_24  = 0x43;
@@ -455,6 +457,79 @@ namespace
                   same ? "PASS" : "FAIL", same ? "differ" : "MATCH");
   }
 
+  /// T9: is READ_BUFCOUNT recomputed on every FIFO refill?
+  /// The released host sends 0x09 once and then repeats plain reads while waiting for
+  /// the queue to recover. A test that resends the command each time rebuilds the reply
+  /// each time and cannot detect the latch-at-command-completion defect, so mirror the host.
+  /// It takes about 6 seconds, so it is excluded from the automatic suite and runs only on '9'.
+  void test_bufcount_live(void)
+  {
+    Serial.println("== T9 READ_BUFCOUNT live response ==");
+
+    // Queue 300 heavy full-screen 1 px COPYRECTs to create a window where the value changes.
+    const uint8_t copyrect[7] = { CMD_COPYRECT, 0, 0, 133, 239, 1, 0 };
+    for (int i = 0; i < 300; ++i)
+    {
+      i2c_write(copyrect, sizeof(copyrect));
+    }
+
+    // Send 0x09 exactly once here; the loop below must not resend it.
+    if (!i2c_write1(CMD_READ_BUFCOUNT))
+    {
+      Serial.println("  READ_BUFCOUNT command write FAIL");
+      return;
+    }
+
+    uint8_t values[80] = {0};
+    int received = 0;
+    // Draining the COPYRECTs takes 300 x ~7 ms = 2.1 s. A short window would end before
+    // recovery, so keep observing for 80 x 50 ms = 4 s until it returns to 0xFF.
+    for (int i = 0; i < 80; ++i)
+    {
+      if (Wire.requestFrom((int)SLAVE_ADDR, 1, (int)true) == 1)
+      {
+        values[received++] = Wire.read();
+      }
+      delay(50);
+    }
+
+    Serial.print("  values: ");
+    for (int i = 0; i < received; ++i)
+    {
+      Serial.printf("%02X ", values[i]);
+    }
+    Serial.println();
+
+    int distinct = 0;
+    for (int i = 0; i < received; ++i)
+    {
+      bool seen = false;
+      for (int k = 0; k < i; ++k)
+      {
+        if (values[k] == values[i])
+        {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) ++distinct;
+    }
+
+    const bool congested = received > 0 && values[0] != 0xFF;
+    const bool live = distinct >= 2;
+    const bool recovered = received > 0 && values[received - 1] == 0xFF;
+    Serial.printf("  distinct=%d first=0x%02X last=0x%02X\n",
+                  distinct, received ? values[0] : 0, received ? values[received - 1] : 0);
+    if (!congested)
+    {
+      Serial.println("  INVALID: queue was not congested; increase COPYRECT count");
+      return;
+    }
+    Serial.printf("  live=%s recovered=%s -> %s\n",
+                  live ? "yes" : "NO", recovered ? "yes" : "NO",
+                  (live && recovered) ? "PASS" : "FAIL");
+  }
+
   /// Lists the addresses that ACK, so a unit whose address was changed is not mistaken.
   void scan_bus(void)
   {
@@ -508,6 +583,7 @@ void setup(void)
   Serial.println("# serial input: '6'=IAP abandon test (DANGEROUS, see comments)");
   Serial.println("#               '7'=invalid CHANGE_ADDR test");
   Serial.println("#               '8'=UPDATE_END magic test (read comments first)");
+  Serial.println("#               '9'=READ_BUFCOUNT live response test (~6 seconds)");
   Serial.println("############################################################");
 }
 
@@ -519,6 +595,7 @@ void loop(void)
     if (c == '6') test_iap_abandon();
     if (c == '7') test_change_addr_invalid();
     if (c == '8') test_update_end_magic();
+    if (c == '9') test_bufcount_live();
   }
 
   ++g_run;

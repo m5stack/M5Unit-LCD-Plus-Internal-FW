@@ -20,6 +20,7 @@ namespace i2c_slave
     std::uint32_t rx_bytes;
     std::uint32_t tx_fifo_events;
     std::uint32_t tx_bytes;
+    std::uint32_t tx_capacity_violations;
     std::uint32_t stretch_address;
     std::uint32_t stretch_tx_empty;
     std::uint32_t stretch_other;
@@ -30,8 +31,8 @@ namespace i2c_slave
   void start_isr(void);
   void stop_isr(void);
   void reset(void);
-  void add_txdata(const std::uint8_t* buf, std::size_t len);
-  void add_txdata(std::uint8_t buf);
+  // Reads the free FIFO space and writes everything through a 32-byte DRAM staging buffer.
+  void fill_txdata(void);
   void clear_txdata(void);
   void get_diagnostics(diagnostics_t* diagnostics);
 }
