@@ -1,7 +1,8 @@
 # Unit LCD Plus Encoder Protocol
 
-Firmware 0.5 adds rotary encoder and push-button input without changing any
-existing Unit LCD command. Multi-byte values below use big-endian byte order.
+Unit LCD Plus adds rotary encoder and push-button input without changing any
+existing Unit LCD command. Use `READ_ID` byte 2 (`MODEL_ID`) to detect the
+product, not the firmware version. Multi-byte values below use big-endian byte order.
 The complete Chinese protocol specification is in
 [`encoder_button_protocol_zh.md`](encoder_button_protocol_zh.md).
 

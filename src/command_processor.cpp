@@ -30,7 +30,9 @@ namespace command_processor
   static constexpr char NVS_KEY_I2CADDR[] = "ADDR";
   /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
   /// arriving during an OTA flash write (cache disabled) would panic.
-  static const DRAM_ATTR std::uint8_t read_id_data[] = { 0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION };
+  static const DRAM_ATTR std::uint8_t read_id_data[] = {
+    0x77, 0x89, static_cast<std::uint8_t>(board_config::MODEL_ID), READ_ID_FIRMWARE_VERSION
+  };
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
@@ -718,6 +720,23 @@ namespace command_processor
     return true;
   }
 
+  /// Orientation of the splash. The panel is a 135 x 240 portrait, so the model name only
+  /// fits when drawn in landscape (240 x 135). The host coordinate system stays at rotation 0.
+  static constexpr std::uint8_t SPLASH_ROTATION = 1;
+
+  /// Splash screen. Takes a base-class reference so the same picture is drawn on both the panel and the canvas.
+  static void drawSplash(lgfx::LovyanGFX& gfx)
+  {
+    gfx.setFont(&fonts::Font4);
+    gfx.setCursor(0, 0);
+    gfx.printf("Addr : 0x%02x", _i2c_addr);
+    gfx.setCursor(0, 45);
+    gfx.printf("%s", board_config::MODEL_NAME);
+    gfx.setCursor(0, 90);
+    gfx.printf("FW : %u%s", static_cast<unsigned>(FIRMWARE_VERSION),
+               FIRMWARE_DEBUG ? " debug" : "");
+  }
+
   void setup(void)
   {
     set_backlight(_brightness);
@@ -766,15 +785,15 @@ namespace command_processor
     ESP_LOGI(LOGNAME, "LCD init=%d", lcd_init_ok);
     _lcd.startWrite();
     ESP_LOGI(LOGNAME, "LCD startWrite complete");
+    // Only the splash is drawn in landscape. The panel is a 135 x 240 portrait and the model
+    // name in Font4 would be cut off. The coordinate system exposed to the host stays at
+    // rotation 0, so restore it afterwards (the default orientation seen by the protocol is unchanged).
+    _lcd.setRotation(SPLASH_ROTATION);
     _lcd.fillScreen(TFT_WHITE);
     ESP_LOGI(LOGNAME, "LCD fillScreen complete");
     _lcd.setTextColor(TFT_BLACK, TFT_WHITE);
 
-    _lcd.setFont(&fonts::Font4);
-    _lcd.setCursor(0,0);
-    _lcd.printf("Addr : 0x%02x", _i2c_addr);
-    _lcd.setCursor(0,216);
-    _lcd.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
+    drawSplash(_lcd);
     ESP_LOGI(LOGNAME, "LCD startup text complete");
     _lcd.setColorDepth(24);
     _canvas.setColorDepth (24);
@@ -791,16 +810,15 @@ namespace command_processor
                static_cast<int>(canvas_width), static_cast<int>(canvas_height));
       abort();
     }
-    _canvas.setRotation(0);
     // The splash was drawn directly to the panel. Mirror it into the backing
     // store so the first partial host update starts from the same frame.
+    // Draw in the same orientation as the panel, then return to rotation 0. The sprite rotation
+    // only changes the coordinate transform while drawing, so the picture stays after restoring it.
+    _canvas.setRotation(SPLASH_ROTATION);
     _canvas.fillScreen(TFT_WHITE);
     _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
-    _canvas.setFont(&fonts::Font4);
-    _canvas.setCursor(0, 0);
-    _canvas.printf("Addr : 0x%02x", _i2c_addr);
-    _canvas.setCursor(0, 216);
-    _canvas.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
+    drawSplash(_canvas);
+    _canvas.setRotation(0);
     _dirty_valid = false;
     _lcd.endWrite();
     ESP_LOGI(LOGNAME, "LCD canvas complete");

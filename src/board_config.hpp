@@ -8,6 +8,8 @@
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
 
+#include "common.hpp"
+
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
  #define UNIT_LCD_HAS_ENCODER 1
 #elif defined(CONFIG_IDF_TARGET_ESP32)
@@ -47,7 +49,9 @@ namespace board_config
   static constexpr std::uint16_t CPU_POWER_MIN_MHZ[] = { 40, 80, 160 };
   static constexpr std::uint16_t CPU_POWER_MAX_MHZ[] = { 40, 160, 160 };
   static constexpr std::uint16_t IDLE_POLL_INTERVAL_MS = 1;
-  static constexpr std::uint8_t DEFAULT_FIRMWARE_MINOR = 5;
+  static constexpr model_id_t MODEL_ID = model_id_t::unit_lcd_plus;
+  static constexpr char MODEL_NAME[] = "Unit LCD Plus";
+  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = UNIT_LCD_DEFAULT_FIRMWARE_VERSION;
   // The C61 clock-stretches at the queue high-water mark, so a queue deeper than the
   // 512-entry flow-control window the host uses is unnecessary. Returning static DRAM
   // to the heap guarantees a contiguous stack for the OTA task.
@@ -79,7 +83,10 @@ namespace board_config
   static constexpr std::uint16_t CPU_POWER_MIN_MHZ[] = { 20, 80, 240 };
   static constexpr std::uint16_t CPU_POWER_MAX_MHZ[] = { 20, 160, 240 };
   static constexpr std::uint16_t IDLE_POLL_INTERVAL_MS = 0;
-  static constexpr std::uint8_t DEFAULT_FIRMWARE_MINOR = 3;
+  // The shipped original already returns 0 in READ_ID byte 2; keep that value as its model id.
+  static constexpr model_id_t MODEL_ID = model_id_t::unit_lcd;
+  static constexpr char MODEL_NAME[] = "Unit LCD";
+  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = UNIT_LCD_DEFAULT_FIRMWARE_VERSION;
   // So the original can hold the canvas and the command queue at once, keep the queue in
   // static DRAM but shrink it to 0x1000 entries, still far above the 512 entries advertised by READ_BUFCOUNT.
   static constexpr std::size_t RX_QUEUE_CAPACITY = 0x1000;

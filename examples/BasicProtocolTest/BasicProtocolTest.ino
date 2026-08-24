@@ -14,9 +14,17 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <cstdint>
 
 namespace
 {
+  /// The MODEL_ID table in docs/Unit_LCD_Plus_I2C_Protocol_zh.md section 6.1 is authoritative; each enumerator maps 1:1 to that value.
+  enum class model_id_t : std::uint8_t
+  {
+    unit_lcd = 0,
+    unit_lcd_plus = 1,
+  };
+
   // Adjust to the wiring. Example for Grove Port A:
   //   M5Stack CoreS3 : SDA = GPIO2  / SCL = GPIO1
   //   M5Tab5         : SDA = GPIO53 / SCL = GPIO54
@@ -165,7 +173,7 @@ namespace
   // Individual tests
   //--------------------------------------------------------------------------
 
-  /// T1: READ_ID (section 6.1). Expected 77 89 00 xx (xx = firmware minor).
+  /// T1: READ_ID (section 6.1). [2] is MODEL_ID, [3] is the debug bit plus the shared version number.
   void test_read_id(void)
   {
     uint8_t rd[4] = {0};
@@ -175,10 +183,17 @@ namespace
       ++g_spec_fail;
       return;
     }
-    const bool ok = (rd[0] == 0x77 && rd[1] == 0x89 && rd[2] == 0x00);
+    // Either model may be attached, so MODEL_ID is judged by whether it is a known value.
+    // Checking only the signature would let an undefined MODEL_ID pass unnoticed.
+    const bool ok = (rd[0] == 0x77 && rd[1] == 0x89
+                  && rd[2] <= static_cast<std::uint8_t>(model_id_t::unit_lcd_plus));
+    const uint8_t version = rd[3] & 0x7F;
+    const bool debug = (rd[3] & 0x80) != 0;
     Serial.print("  T1 READ_ID              : ");
     print_hex(rd, sizeof(rd));
-    Serial.printf("  expect 77 89 00 ??  -> %s (firmware minor=%u)\n", ok ? "OK" : "NG", rd[3]);
+    Serial.printf("  expect 77 89 <model:0|1> <debug|version> -> %s "
+                  "(MODEL_ID=%u, version=%u, debug=%s)\n",
+                  ok ? "OK" : "NG", rd[2], version, debug ? "yes" : "no");
     ok ? ++g_spec_pass : ++g_spec_fail;
   }
 
