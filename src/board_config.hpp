@@ -39,10 +39,12 @@ namespace board_config
   static constexpr gpio_num_t PIN_LCD_BL = GPIO_NUM_25;
 
   static constexpr spi_host_device_t LCD_SPI_HOST = SPI2_HOST;
-  static constexpr std::uint8_t LCD_DMA_CHANNEL = 0;
+  // M5GFX 0.2.27 fixes the C61 AHB_DMA descriptor address register.
+  // A nonzero value requests automatic DMA channel allocation on current ESP-IDF.
+  static constexpr std::uint8_t LCD_DMA_CHANNEL = 1;
   static constexpr std::int8_t PIN_LCD_MISO = -1;
   static constexpr bool LCD_BACKLIGHT_INVERTED = false;
-  static constexpr bool LCD_FLUSH_SWAP_BYTES = false;
+  static constexpr bool LCD_ASYNC_DMA = true;
 
   static constexpr std::uint16_t CPU_IDLE_MHZ = 40;
   static constexpr std::uint16_t CPU_ACTIVE_MHZ = 160;
@@ -76,7 +78,8 @@ namespace board_config
   static constexpr std::uint8_t LCD_DMA_CHANNEL = 2;
   static constexpr std::int8_t PIN_LCD_MISO = GPIO_NUM_14;
   static constexpr bool LCD_BACKLIGHT_INVERTED = true;
-  static constexpr bool LCD_FLUSH_SWAP_BYTES = true;
+  // M5GFX's original-ESP32 DMA workaround is released by endTransaction().
+  static constexpr bool LCD_ASYNC_DMA = false;
 
   static constexpr std::uint16_t CPU_IDLE_MHZ = 20;
   static constexpr std::uint16_t CPU_ACTIVE_MHZ = 240;

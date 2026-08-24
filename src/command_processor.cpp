@@ -241,14 +241,19 @@ namespace command_processor
 
   static void flush_canvas_to_lcd(void)
   {
-    // Keep the original, known-good framebuffer commit path. The sprite
-    // buffer is already in the panel's native 24-bit stream format.
-    _lcd.startWrite();
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      _lcd.startWrite();
+    }
     _lcd.setWindow(0, 0, board_config::LCD_WIDTH - 1,
                    board_config::LCD_HEIGHT - 1);
     _spi_bus.writeBytes(static_cast<const std::uint8_t*>(_canvas.getBuffer()),
-                        _canvas.bufferLength(), true, board_config::LCD_FLUSH_SWAP_BYTES);
-    _lcd.endWrite();
+                        _canvas.bufferLength(), true, true);
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      // The original ESP32 M5GFX path releases its DMA workaround here.
+      _lcd.endWrite();
+    }
     _dirty_valid = false;
   }
 
@@ -798,7 +803,8 @@ namespace command_processor
     {
       auto cfg = _spi_bus.config();
       cfg.spi_host = board_config::LCD_SPI_HOST;
-      // The C61 uses the synchronous register path; the original ESP32 keeps DMA channel 2 as shipped.
+      // The C61 uses the AHB_DMA fixed in M5GFX 0.2.27; the original ESP32 keeps
+      // DMA channel 2 as shipped.
       cfg.dma_channel = board_config::LCD_DMA_CHANNEL;
       cfg.freq_write = 40000000;
       cfg.freq_read  = 14000000;
@@ -864,8 +870,12 @@ namespace command_processor
     _canvas.setRotation(0);
     _dirty_valid = false;
     _canvas_ready = true;
-    _lcd.endWrite();
-    ESP_LOGI(LOGNAME, "LCD canvas complete");
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      _lcd.endWrite();
+    }
+    ESP_LOGI(LOGNAME, "LCD canvas complete; asynchronous DMA=%d",
+             board_config::LCD_ASYNC_DMA);
 
     cpu_clock::init();
     cpu_clock::request_clock_down(
@@ -952,13 +962,12 @@ namespace command_processor
         static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_ACTIVE_MHZ));
     }
     // The framebuffer is committed after the commands currently available in
-    // the RX queue have been applied. Only the accumulated dirty rectangle is
-    // transferred, so a local update never sends or clears the whole screen.
+    // the RX queue have been applied. C61 leaves DMA running asynchronously;
+    // the original ESP32 closes the transaction to release M5GFX's DMA guard.
     if (_modified && !_spi_bus.busy())
     {
       _modified = false;
-      // M5GFX's generic C61 GDMA path does not complete reliably. Send the
-      // panel's native 24-bit stream through the synchronous register path.
+      // The panel's native 24-bit stream can be transferred without conversion.
       flush_canvas_to_lcd();
     }
   }
