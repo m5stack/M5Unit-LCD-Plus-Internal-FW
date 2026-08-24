@@ -160,6 +160,8 @@ namespace command_processor
     finish ,        // 全行程終了
   };
   firmupdate_state_t _firmupdate_state = nothing;
+  static constexpr TickType_t FIRMUPDATE_INACTIVITY_TIMEOUT_TICKS = pdMS_TO_TICKS(5000);
+  volatile TickType_t _firmupdate_last_activity_tick = 0;
   std::size_t _firmupdate_index = 0;
   std::size_t _firmupdate_totalsize = 0;
   std::size_t _firmupdate_result = 0;
@@ -660,7 +662,6 @@ namespace command_processor
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_BEGIN:
       _modified = false;
       cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
-      update::initCRCtable();
       _lcd.fillScreen(TFT_WHITE);
       _lcd.drawString("update", 0, 0);
       _lcd.fillRect(10, 112, _lcd.width() - 20, 17, TFT_BLACK);
@@ -669,6 +670,12 @@ namespace command_processor
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
+      // A block with a CRC mismatch is discarded in the ISR and never enters sector_write.
+      // Even if that command is still in the queue, do not overwrite BROKEN with BUSY/ERROR.
+      if (_firmupdate_state != firmupdate_state_t::sector_write)
+      {
+        break;
+      }
       _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BUSY;
       _modified = false;
       ESP_LOGI(LOGNAME, "flash:%d", _firmupdate_index);
@@ -716,6 +723,10 @@ namespace command_processor
     set_backlight(_brightness);
 
     load_nvs();
+
+    // UPDATE_BEGIN runs in the main task and the following UPDATE_DATA in the ISR, so building
+    // the table between commands would race. Build it once at boot before the I2C interrupt is installed.
+    update::initCRCtable();
 
 #if DEBUG == 1
     lgfx::pinMode(0, lgfx::pin_mode_t::output);
@@ -928,6 +939,27 @@ namespace command_processor
     _param_resetindex = 0;
   }
 
+  static inline void IRAM_ATTR markFirmupdateActivity(void)
+  {
+    _firmupdate_last_activity_tick = xTaskGetTickCountFromISR();
+  }
+
+  static inline void IRAM_ATTR expireAbandonedFirmupdate(void)
+  {
+    if (_firmupdate_state == firmupdate_state_t::nothing || !_nvs_push || _param_index != 0) return;
+    const TickType_t now = xTaskGetTickCountFromISR();
+    if (now - _firmupdate_last_activity_tick < FIRMUPDATE_INACTIVITY_TIMEOUT_TICKS) return;
+
+    // Abandon the session if no IAP byte arrives for 5 seconds. Clearing only _nvs_push would
+    // let a partial payload or UPDATE_END be processed as the old session, so close the state and parser too.
+    // If the parser is mid-command, do not close yet; defer expiry to the next command boundary.
+    // Recovering a few bytes late is safer than splitting an in-flight, order-dependent draw command.
+    // The check is a tick comparison in the ISR when the next write byte arrives; no timer task or logging.
+    _nvs_push = false;
+    _firmupdate_state = firmupdate_state_t::nothing;
+    closeData();
+  }
+
   bool IRAM_ATTR rxNeedsBackpressure(void)
   {
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
@@ -1047,6 +1079,7 @@ namespace command_processor
   /// I2CペリフェラルISRから1Byteずつデータを受取る処理
   bool IRAM_ATTR addData(std::uint8_t value)
   {
+    expireAbandonedFirmupdate();
     _params[_param_index] = value;
 
     if (++_param_index == 1)
@@ -1160,6 +1193,15 @@ namespace command_processor
 #endif
       }
     }
+
+    // Only UPDATE_DATA/END write bytes count as IAP activity. Plain status reads and
+    // READ_BUFCOUNT polls do not extend the deadline; a legitimately slow block extends it on every byte.
+    if (_firmupdate_state != firmupdate_state_t::nothing
+     && (_params[0] == lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA
+      || _params[0] == lgfx::Panel_M5UnitLCD::CMD_UPDATE_END))
+    {
+      markFirmupdateActivity();
+    }
     else
     if (_param_index == 3 && (_params[0] & ~7) == lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE)
     { // RLEエンコードされたピクセル情報の展開
@@ -1216,6 +1258,9 @@ namespace command_processor
         )
         {
           _firmupdate_state = firmupdate_state_t::wait_data;
+          // Throttling starts with the first UPDATE_DATA header, so a session with only BEGIN
+          // never expires. Hosts that need more than 5 s to prepare SD/network are accepted, and
+          // a wait_data left behind stays the unthrottled behaviour it always was.
           _firmupdate_index = 0;
           _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_ERROR; /// 途中中断した時のためリード応答にはエラーステートを設定しておく
           _firmupdate_totalsize = _params[4] << 24 | _params[5] << 16 | _params[6] << 8 | _params[7];
@@ -1242,19 +1287,29 @@ namespace command_processor
           if (update::checkCRC32())
           {
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BUSY;
+            _firmupdate_state = firmupdate_state_t::sector_write;
           }
           else
           {
+            // A block with a CRC mismatch is not queued; wait for a resend at the same offset.
+            // BROKEN stays the live reply until the next UPDATE_DATA header or UPDATE_BEGIN.
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BROKEN;
+            update::discardBlock();
+            _firmupdate_state = firmupdate_state_t::wait_data;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+            i2c_slave::fill_txdata();
+#endif
+            closeData();
+            return false;
           }
 #if defined(CONFIG_IDF_TARGET_ESP32)
           i2c_slave::fill_txdata();
 #endif
-          _firmupdate_state = sector_write;
           closeData();
         }
         else
-        if ((_params[1] == 0x77)
+        if ((_firmupdate_state != firmupdate_state_t::nothing)
+         && (_params[1] == 0x77)
          && (_params[2] == 0x89)
          && (_params[0] == _params[3])
         )

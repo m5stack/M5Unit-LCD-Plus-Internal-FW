@@ -101,6 +101,14 @@ namespace update
     return _crc32 == _calc_crc32;
   }
 
+  void IRAM_ATTR discardBlock(void)
+  {
+    // A block with a CRC mismatch is never written to flash. Rewind the session byte count
+    // advanced by addData() to the block start so a resend at the same offset is accepted.
+    _totalindex -= _bufindex;
+    _bufindex = 0;
+  }
+
   static void writeTask(void* args)
   {
     auto info = (write_info_t*)args;
