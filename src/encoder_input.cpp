@@ -3,6 +3,9 @@
 //! Gray-code decoding is adapted from esp-idf-lib/encoder; see LICENSES/encoder-BSD-3-Clause.txt.
 
 #include "encoder_input.hpp"
+#include "board_config.hpp"
+
+#if UNIT_LCD_HAS_ENCODER
 
 #include <climits>
 #include <cstddef>
@@ -12,7 +15,6 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 
-#include "board_config.hpp"
 #include "unit_lcd_plus_protocol.hpp"
 
 namespace encoder_input
@@ -299,3 +301,5 @@ namespace encoder_input
     portEXIT_CRITICAL_ISR(&lock);
   }
 }
+
+#endif

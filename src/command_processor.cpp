@@ -6,6 +6,7 @@
 #include <driver/ledc.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <cstdlib>
 #include <cstring>
 
 #include <Arduino.h>
@@ -34,7 +35,7 @@ namespace command_processor
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
   static constexpr std::uint8_t I2C_MIN_ADDR = 0x08;
   static constexpr std::uint8_t I2C_MAX_ADDR = 0x77;
-  static constexpr std::size_t RX_BUFFER_MAX = 0x2000;
+  static constexpr std::size_t RX_BUFFER_MAX = board_config::RX_QUEUE_CAPACITY;
   static constexpr std::size_t PARAM_MAXLEN = 12;
 
 
@@ -42,7 +43,6 @@ namespace command_processor
   volatile std::size_t _rx_buffer_getpos = 0;
 
   std::uint8_t _rx_buffer[RX_BUFFER_MAX][PARAM_MAXLEN];
-
   std::uint8_t* _params = _rx_buffer[0];
   std::size_t _param_index = 0;
   std::size_t _param_need_count = 1;
@@ -136,9 +136,11 @@ namespace command_processor
   std::size_t _firmupdate_totalsize = 0;
   std::size_t _firmupdate_result = 0;
   std::size_t _last_command = 0;
+#if UNIT_LCD_HAS_ENCODER
   std::uint8_t _encoder_state_response[unit_lcd_plus_protocol::ENCODER_STATE_SIZE] = {};
   std::uint8_t _encoder_event_response[unit_lcd_plus_protocol::ENCODER_EVENT_SIZE] = {};
   std::uint8_t _button_config_response[unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE] = {};
+#endif
 
   std::uint_fast8_t _brightness = 128;
   bool _backlight_pwm_attached = false;
@@ -148,6 +150,10 @@ namespace command_processor
     constexpr ledc_mode_t speed_mode = LEDC_LOW_SPEED_MODE;
     constexpr ledc_timer_t timer = LEDC_TIMER_0;
     constexpr ledc_channel_t channel = LEDC_CHANNEL_0;
+
+    const std::uint32_t duty = board_config::LCD_BACKLIGHT_INVERTED
+                             ? 255u - brightness
+                             : brightness;
 
     if (!_backlight_pwm_attached)
     {
@@ -164,7 +170,7 @@ namespace command_processor
       channel_config.channel = channel;
       channel_config.intr_type = LEDC_INTR_DISABLE;
       channel_config.timer_sel = timer;
-      channel_config.duty = brightness;
+      channel_config.duty = duty;
       channel_config.hpoint = 0;
 
       _backlight_pwm_attached = ledc_timer_config(&timer_config) == ESP_OK
@@ -172,14 +178,15 @@ namespace command_processor
     }
 
     if (_backlight_pwm_attached
-     && ledc_set_duty(speed_mode, channel, brightness) == ESP_OK
+     && ledc_set_duty(speed_mode, channel, duty) == ESP_OK
      && ledc_update_duty(speed_mode, channel) == ESP_OK)
     {
       return;
     }
 
     gpio_set_direction(board_config::PIN_LCD_BL, GPIO_MODE_OUTPUT);
-    gpio_set_level(board_config::PIN_LCD_BL, brightness ? 1 : 0);
+    const bool enabled_level = board_config::LCD_BACKLIGHT_INVERTED ? false : true;
+    gpio_set_level(board_config::PIN_LCD_BL, brightness ? enabled_level : !enabled_level);
   }
 
   static void flush_canvas_to_lcd(void)
@@ -190,10 +197,34 @@ namespace command_processor
     _lcd.setWindow(0, 0, board_config::LCD_WIDTH - 1,
                    board_config::LCD_HEIGHT - 1);
     _spi_bus.writeBytes(static_cast<const std::uint8_t*>(_canvas.getBuffer()),
-                        _canvas.bufferLength(), true, false);
+                        _canvas.bufferLength(), true, board_config::LCD_FLUSH_SWAP_BYTES);
     _lcd.endWrite();
     _dirty_valid = false;
   }
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+  static void setup_i2c_on_core0(void* main_handle)
+  {
+    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
+                                             board_config::PIN_I2C_SDA,
+                                             board_config::PIN_I2C_SCL,
+                                             _i2c_addr,
+                                             main_handle,
+                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
+             i2c_init_ok,
+             _i2c_addr,
+             board_config::PIN_I2C_SDA,
+             gpio_get_level(board_config::PIN_I2C_SDA),
+             board_config::PIN_I2C_SCL,
+             gpio_get_level(board_config::PIN_I2C_SCL));
+    if (!i2c_init_ok)
+    {
+      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
+    }
+    vTaskDelete(nullptr);
+  }
+#endif
 
   std::uint_fast16_t _xs = 0;
   std::uint_fast16_t _xe = 0;
@@ -296,11 +327,13 @@ namespace command_processor
 
   static void IRAM_ATTR set_power_mode(std::uint8_t mode)
   {
-    switch (mode)
+    constexpr std::size_t mode_count = sizeof(board_config::CPU_POWER_MIN_MHZ)
+                                     / sizeof(board_config::CPU_POWER_MIN_MHZ[0]);
+    if (mode < mode_count)
     {
-    case 0:  cpu_clock::set_clock_limit(cpu_clock::clock_40MHz,  cpu_clock::clock_40MHz ); break;
-    case 1:  cpu_clock::set_clock_limit(cpu_clock::clock_80MHz,  cpu_clock::clock_160MHz); break;
-    case 2:  cpu_clock::set_clock_limit(cpu_clock::clock_160MHz, cpu_clock::clock_160MHz); break;
+      cpu_clock::set_clock_limit(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MIN_MHZ[mode]),
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MAX_MHZ[mode]));
     }
   }
 
@@ -636,14 +669,13 @@ namespace command_processor
 
     {
       auto cfg = _spi_bus.config();
-      cfg.spi_host = SPI2_HOST;
-      // C61's current generic GDMA path can stall during full-frame transfers.
-      // Disable DMA so M5GFX uses its synchronous register conversion path.
-      cfg.dma_channel = 0;
+      cfg.spi_host = board_config::LCD_SPI_HOST;
+      // The C61 uses the synchronous register path; the original ESP32 keeps DMA channel 2 as shipped.
+      cfg.dma_channel = board_config::LCD_DMA_CHANNEL;
       cfg.freq_write = 40000000;
       cfg.freq_read  = 14000000;
       cfg.pin_mosi = board_config::PIN_LCD_MOSI;
-      cfg.pin_miso = -1;
+      cfg.pin_miso = board_config::PIN_LCD_MISO;
       cfg.pin_sclk = board_config::PIN_LCD_SCLK;
       cfg.pin_dc   = board_config::PIN_LCD_DC;
       cfg.spi_3wire = true;
@@ -685,7 +717,14 @@ namespace command_processor
     _modified = false;
     _lcd.setRotation(0);
     _lcd.setWindow(0, 0, _lcd.width()-1, _lcd.height()-1);
-    _canvas.createSprite(_lcd.width(), _lcd.height());
+    const auto canvas_width = _lcd.width();
+    const auto canvas_height = _lcd.height();
+    if (_canvas.createSprite(canvas_width, canvas_height) == nullptr)
+    {
+      ESP_LOGE(LOGNAME, "LCD canvas allocation failed: %d x %d x 3 bytes",
+               static_cast<int>(canvas_width), static_cast<int>(canvas_height));
+      abort();
+    }
     _canvas.setRotation(0);
     // The splash was drawn directly to the panel. Mirror it into the backing
     // store so the first partial host update starts from the same frame.
@@ -701,17 +740,33 @@ namespace command_processor
     ESP_LOGI(LOGNAME, "LCD canvas complete");
 
     cpu_clock::init();
-    cpu_clock::request_clock_down(cpu_clock::clock_80MHz);
+    cpu_clock::request_clock_down(
+      static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MIN_MHZ[1]));
     set_power_mode(1);
     ESP_LOGI(LOGNAME, "CPU clock setup complete");
 
+#if UNIT_LCD_HAS_ENCODER
     const bool encoder_init_ok = encoder_input::setup();
     ESP_LOGI(LOGNAME, "Encoder init=%d A=%d B=%d button=%d",
              encoder_init_ok,
              board_config::PIN_ENCODER_A,
              board_config::PIN_ENCODER_B,
              board_config::PIN_ENCODER_BUTTON);
+#endif
 
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // On the original, keep the I2C ISR on core 0 as before, separate from the Arduino loop on core 1.
+    if (xTaskCreatePinnedToCore(setup_i2c_on_core0,
+                               "i2cSetup",
+                               8192,
+                               xTaskGetCurrentTaskHandle(),
+                               0,
+                               nullptr,
+                               0) != pdPASS)
+    {
+      ESP_LOGE(LOGNAME, "I2C setup task creation failed");
+    }
+#else
     const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
                                              board_config::PIN_I2C_SDA,
                                              board_config::PIN_I2C_SCL,
@@ -729,6 +784,7 @@ namespace command_processor
     {
       ESP_LOGE(LOGNAME, "I2C slave initialization failed");
     }
+#endif
   /*
     auto ms = lgfx::millis();
     lgfx::pinMode(0, lgfx::pin_mode_t::input_pullup);
@@ -782,12 +838,16 @@ namespace command_processor
     }
     if (!processed_command && !_modified && _firmupdate_state == firmupdate_state_t::nothing)
     {
-      cpu_clock::request_clock_down(cpu_clock::clock_40MHz);
-      // Address persistence and OTA deliberately suppress ISR task notifications
-      // while flash is involved. Poll briefly so those queued commands cannot
-      // leave the single-core C61 main task asleep indefinitely.
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
-      cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
+      cpu_clock::request_clock_down(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_IDLE_MHZ));
+      // The C61 polls in case notifications are suppressed during flash work; the dual-core
+      // original blocks until notified as shipped and keeps its 20 MHz idle.
+      const TickType_t wait_ticks = board_config::IDLE_POLL_INTERVAL_MS
+                                  ? pdMS_TO_TICKS(board_config::IDLE_POLL_INTERVAL_MS)
+                                  : portMAX_DELAY;
+      ulTaskNotifyTake(pdTRUE, wait_ticks);
+      cpu_clock::request_clock_up(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_ACTIVE_MHZ));
     }
     // The framebuffer is committed after the commands currently available in
     // the RX queue have been applied. Only the accumulated dirty rectangle is
@@ -835,9 +895,11 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
       case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
       case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+#endif
         _param_need_count = 1;
         break;
 
@@ -911,6 +973,7 @@ namespace command_processor
         _param_need_count = 8;
         return false;
 
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_ACK_ENCODER_EVENT:
       case unit_lcd_plus_protocol::CMD_SET_BUTTON_CONFIG:
         _param_need_count = 3;
@@ -919,6 +982,7 @@ namespace command_processor
       case unit_lcd_plus_protocol::CMD_SET_ENCODER_POSITION:
         _param_need_count = 5;
         return false;
+#endif
       }
     }
     else
@@ -1090,6 +1154,7 @@ namespace command_processor
         closeData();
         return false;
 
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
         encoder_input::read_state(_encoder_state_response);
         prepareTxData();
@@ -1122,6 +1187,7 @@ namespace command_processor
         encoder_input::set_button_config(unit_lcd_plus_protocol::read_u16_be(&_params[1]));
         closeData();
         return false;
+#endif
       }
 
       auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
@@ -1183,6 +1249,7 @@ namespace command_processor
       }
       break;
 
+#if UNIT_LCD_HAS_ENCODER
     case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
       i2c_slave::add_txdata(_encoder_state_response, sizeof(_encoder_state_response));
       break;
@@ -1194,6 +1261,7 @@ namespace command_processor
     case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
       i2c_slave::add_txdata(_button_config_response, sizeof(_button_config_response));
       break;
+#endif
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:

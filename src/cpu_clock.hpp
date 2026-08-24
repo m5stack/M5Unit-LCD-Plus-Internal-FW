@@ -3,13 +3,19 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace cpu_clock
 {
-  enum cpu_clock_t
+  enum cpu_clock_t : std::uint16_t
   {
-    clock_40MHz,
-    clock_80MHz,
-    clock_160MHz,
+    clock_8MHz = 8,
+    clock_10MHz = 10,
+    clock_20MHz = 20,
+    clock_40MHz = 40,
+    clock_80MHz = 80,
+    clock_160MHz = 160,
+    clock_240MHz = 240,
     clock_MAX,
   };
 

@@ -6,12 +6,14 @@
 
 #include <driver/gpio.h>
 #include <esp_intr_alloc.h>
+#include <esp_private/periph_ctrl.h>
 #include <esp_rom_gpio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <hal/i2c_hal.h>
 #include <hal/i2c_ll.h>
 #include <soc/i2c_periph.h>
+#include <soc/soc_caps.h>
 
 #include "command_processor.hpp"
 #include "i2c_slave.hpp"
@@ -20,8 +22,11 @@ namespace i2c_slave
 {
   namespace
   {
+    // The original ESP32 cannot wait on a read address match, so keep an RX threshold of 1
+    // so a 1-byte read command is handled before the repeated START.
     constexpr std::uint32_t RX_FIFO_FULL_THRESHOLD = 1;
     constexpr std::uint32_t TX_FIFO_EMPTY_THRESHOLD = 2;
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
     // C61 encodes this as an exponent: timeout period = 2^value source clocks.
     constexpr std::uint32_t SLAVE_TIMEOUT = 22;
     constexpr std::uint32_t INTERRUPT_MASK = I2C_INTR_SLV_RXFIFO_WM
@@ -29,6 +34,25 @@ namespace i2c_slave
                                            | I2C_INTR_SLV_COMPLETE
                                            | I2C_INTR_START
                                            | I2C_INTR_STRETCH;
+    constexpr std::uint32_t RX_INTERRUPT = I2C_INTR_SLV_RXFIFO_WM;
+    constexpr std::uint32_t TX_INTERRUPT = I2C_INTR_SLV_TXFIFO_WM;
+    constexpr std::uint32_t COMPLETE_INTERRUPT = I2C_INTR_SLV_COMPLETE;
+    constexpr std::uint32_t START_INTERRUPT = I2C_INTR_START;
+#else
+    // Arduino-ESP32 3.x / IDF 5.5 no longer expose the old struct field names, so map the
+    // same FULL/EMPTY/COMPLETE/START bits onto the LL masks.
+    constexpr std::uint32_t SLAVE_TIMEOUT = 0xFFFFF;
+    constexpr std::uint32_t RX_INTERRUPT = I2C_RXFIFO_FULL_INT_ENA_M;
+    constexpr std::uint32_t TX_INTERRUPT = I2C_TXFIFO_EMPTY_INT_ENA_M;
+    constexpr std::uint32_t COMPLETE_INTERRUPT = I2C_TRANS_COMPLETE_INT_ENA_M;
+    constexpr std::uint32_t START_INTERRUPT = I2C_TRANS_START_INT_ENA_M;
+    constexpr std::uint32_t ARBITRATION_INTERRUPT = I2C_ARBITRATION_LOST_INT_ENA_M;
+    constexpr std::uint32_t INTERRUPT_MASK = RX_INTERRUPT
+                                           | TX_INTERRUPT
+                                           | COMPLETE_INTERRUPT
+                                           | START_INTERRUPT
+                                           | ARBITRATION_INTERRUPT;
+#endif
 
     struct i2c_object_t
     {
@@ -81,8 +105,16 @@ namespace i2c_slave
 
     void configure_peripheral()
     {
+#if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
       i2c_ll_enable_bus_clock(i2c_object.port, true);
       i2c_ll_reset_register(i2c_object.port);
+#else
+      PERIPH_RCC_ATOMIC()
+      {
+        i2c_ll_enable_bus_clock(i2c_object.port, true);
+        i2c_ll_reset_register(i2c_object.port);
+      }
+#endif
 
       auto* device = hardware();
       i2c_hal_context_t hal = {.dev = device};
@@ -93,10 +125,23 @@ namespace i2c_slave
       i2c_ll_set_slave_addr(device, i2c_object.address, false);
       i2c_ll_set_txfifo_empty_thr(device, TX_FIFO_EMPTY_THRESHOLD);
       i2c_ll_set_rxfifo_full_thr(device, RX_FIFO_FULL_THRESHOLD);
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
       i2c_ll_set_sda_timing(device, 10, 10);
+#else
+      // Keep sample/hold=4 and the glitch filter enabled (threshold=0) as in the shipped firmware.
+      i2c_ll_set_sda_timing(device, 4, 4);
+      device->ctr.sda_force_out = 1;
+      device->ctr.scl_force_out = 1;
+      device->scl_filter_cfg.en = 1;
+      device->scl_filter_cfg.thres = 0;
+      device->sda_filter_cfg.en = 1;
+      device->sda_filter_cfg.thres = 0;
+#endif
       i2c_ll_set_tout(device, SLAVE_TIMEOUT);
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
       i2c_ll_slave_enable_scl_stretch(device, true);
       i2c_ll_slave_enable_auto_start(device, true);
+#endif
       i2c_ll_clear_intr_mask(device, UINT32_MAX);
       i2c_ll_update(device);
     }
@@ -135,17 +180,27 @@ namespace i2c_slave
       // preparation drops the first 8 pixels and replies from the ninth.
       // Windows of 1/2/4/8 pixels wrap around and hide the defect.
 
-      if (!received_data && (interrupt_status & I2C_INTR_SLV_TXFIFO_WM))
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+      if (!received_data && (interrupt_status & TX_INTERRUPT))
+#else
+      // As before, the original also handles a TX empty raised together with RX later on.
+      if (interrupt_status & TX_INTERRUPT)
+#endif
       {
         ++diagnostic_tx_fifo_events;
         command_processor::prepareTxData();
       }
 
-      if (interrupt_status & (I2C_INTR_SLV_COMPLETE | I2C_INTR_START))
+      if (interrupt_status & (COMPLETE_INTERRUPT | START_INTERRUPT
+#if defined(CONFIG_IDF_TARGET_ESP32)
+                            | ARBITRATION_INTERRUPT
+#endif
+                            ))
       {
         command_processor::closeData();
       }
 
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
       if (interrupt_status & I2C_INTR_STRETCH)
       {
         i2c_slave_stretch_cause_t stretch_cause;
@@ -171,6 +226,7 @@ namespace i2c_slave
         }
         i2c_ll_slave_clear_stretch(device);
       }
+#endif
 
       if (notify)
       {
@@ -199,15 +255,21 @@ namespace i2c_slave
   void IRAM_ATTR add_txdata(const std::uint8_t* buffer, std::size_t length)
   {
     auto* device = hardware();
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
     std::uint32_t available = 0;
     i2c_ll_get_txfifo_len(device, &available);
     const auto write_length = static_cast<std::uint8_t>(std::min<std::size_t>(length, available));
+#else
+    // The original ESP32 refills at most 24 bytes at TX empty threshold=2, so everything fits.
+    // No silent truncation; push the same number of bytes into the FIFO as the shipped firmware.
+    const auto write_length = static_cast<std::uint8_t>(length);
+#endif
     if (write_length != 0)
     {
       i2c_ll_write_txfifo(device, buffer, write_length);
       diagnostic_tx_bytes += write_length;
     }
-    i2c_ll_clear_intr_mask(device, I2C_INTR_SLV_TXFIFO_WM);
+    i2c_ll_clear_intr_mask(device, TX_INTERRUPT);
     i2c_ll_slave_enable_tx_it(device);
   }
 
