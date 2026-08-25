@@ -52,7 +52,6 @@ namespace encoder_input
     std::uint16_t dropped_count = 0;
     std::int32_t position = 0;
     std::uint8_t encoder_code = 0;
-    std::int8_t encoder_phase = 0;
     bool button_pressed = false;
     bool button_long_pressed = false;
     bool button_candidate_pressed = false;
@@ -185,39 +184,22 @@ namespace encoder_input
       encoder_code &= 0x0F;
       if (!(ENCODER_VALID_TRANSITIONS & (1U << encoder_code)))
       {
-        // A re-sample of the same state keeps the partial phase. A diagonal transition has no
-        // determinable direction, so drop it and never join distant valid transitions.
-        if ((encoder_code >> 2) != (encoder_code & 3)) encoder_phase = 0;
+        // Discard re-samples of the same state and diagonal transitions whose direction cannot be determined.
         return;
       }
 
-      // One mechanical detent is two Gray-code transitions (half a cycle). The previous code
-      // matched a full four-transition cycle, so two detents gave +/-1 and the unresolved
-      // half cycle at a reversal was cancelled by the next opposite transition without an event.
-      // Accumulate every valid transition as a signed phase and confirm one detent at +/-2.
-      // A reversed transition subtracts from the same phase, so net displacement is preserved regardless of path.
-      // A single-transition bounce between adjacent states cancels on the way back, and diagonal
-      // invalid transitions reset the phase above. Two consecutive valid transitions in the same
-      // direction are indistinguishable from a real detent, so count them as one and add no time filter.
-      // Even if contact bounce fires the GPIO ISR repeatedly, a round trip to the adjacent state
-      // adds with opposite signs and cancels. No waiting, loops or logging inside the ISR.
+      // Report every valid transition (quadrature edge) as +/-1. One mechanical detent is two
+      // Gray-code transitions (half a cycle), so a detent advances the count by 2.
+      // Expose the highest resolution to the host; a host that wants detent units divides
+      // position by 2 or pairs ROTATE events. The reverse is impossible (a host cannot
+      // raise a lower resolution), which is why edges are the default.
+      // A reversed transition adds with the opposite sign, so net displacement is preserved regardless of path.
+      // Contact bounce between adjacent states shows up as a +1/-1 pair. No waiting, loops or
+      // logging inside the ISR, and no extra time filter.
       // The transition observed for clockwise rotation on hardware (0x2 -> 0xB) is the positive direction.
       // This matches the existing M5Stack convention of clockwise = increase while keeping the
       // A/B pin names and the invalid-transition check: only the sign table is defined, the GPIOs are not swapped.
-      encoder_phase += (ENCODER_CLOCKWISE_TRANSITIONS & (1U << encoder_code)) ? 1 : -1;
-
-      std::int16_t delta = 0;
-      if (encoder_phase >= 2)
-      {
-        encoder_phase -= 2;
-        delta = 1;
-      }
-      else if (encoder_phase <= -2)
-      {
-        encoder_phase += 2;
-        delta = -1;
-      }
-      if (delta == 0) return;
+      const std::int16_t delta = (ENCODER_CLOCKWISE_TRANSITIONS & (1U << encoder_code)) ? 1 : -1;
 
       position = saturated_add(position, delta);
       push_event_locked(ENCODER_EVENT_ROTATE, delta);
@@ -315,11 +297,10 @@ namespace encoder_input
   {
     if (!encoder_interrupts_ready) return;
     portENTER_CRITICAL(&lock);
-    // The order of transitions during the stop cannot be recovered. Joining the pre-stop phase
-    // with the resumed state could create a detent in the wrong direction, so drop the phase and restart from the current state.
+    // The order of transitions during the stop cannot be recovered. Joining the pre-stop state
+    // with the resumed state could create an edge in the wrong direction, so restart from the current state.
     encoder_code = static_cast<std::uint8_t>(gpio_get_level(board_config::PIN_ENCODER_A)
                    | (gpio_get_level(board_config::PIN_ENCODER_B) << 1));
-    encoder_phase = 0;
     portEXIT_CRITICAL(&lock);
     gpio_intr_enable(board_config::PIN_ENCODER_A);
     gpio_intr_enable(board_config::PIN_ENCODER_B);

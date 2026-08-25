@@ -49,7 +49,7 @@ duplicate, stale, or out-of-order ACK has no effect. A short click produces
 `PRESS`, `RELEASE`, then `SINGLE_CLICK` after the fixed 300 ms double-click
 window. A double click produces `PRESS`, `RELEASE`, `PRESS`, `RELEASE`, and
 `DOUBLE_CLICK`, without single-click events. A long press produces `PRESS`,
-`LONG_PRESS`, `RELEASE`. Rotation reports unaccelerated `+1` or `-1` steps. The signed
+`LONG_PRESS`, `RELEASE`. Rotation reports unaccelerated `+1` or `-1` per quadrature edge (two counts per mechanical detent). The signed
 position saturates at the int32 limits.
 
 The fixed queue contains 64 events. When full, the oldest event is discarded,
