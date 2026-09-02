@@ -12,8 +12,6 @@ namespace cpu_clock
 {
   namespace
   {
-    constexpr std::uint32_t clock_mhz[] = {40, 80, 160};
-
     cpu_clock_t clock_min = clock_80MHz;
     cpu_clock_t clock_max = clock_160MHz;
     cpu_clock_t now_clock = clock_MAX;
@@ -27,13 +25,15 @@ namespace cpu_clock
       return;
     }
 
-#if CONFIG_IDF_TARGET_ESP32C61
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
     // Arduino Core 3.3.6's direct RTC clock switch does not return on C61.
     // Keep the CPU at its boot frequency until the core exposes a safe path.
     now_clock = clock_160MHz;
     return;
 #else
-    if (setCpuFrequencyMhz(clock_mhz[clock]))
+    // Arduino-ESP32 3.x uses the public HAL instead of the old
+    // rtc_clk_cpu_freq_set_config_fast(). The 20/80/160/240 MHz profile of the original is kept.
+    if (setCpuFrequencyMhz(static_cast<std::uint32_t>(clock)))
     {
       now_clock = clock;
     }

@@ -1,7 +1,8 @@
 # Unit LCD Plus Encoder Protocol
 
-Firmware 0.5 adds rotary encoder and push-button input without changing any
-existing Unit LCD command. Multi-byte values below use big-endian byte order.
+Unit LCD Plus adds rotary encoder and push-button input without changing any
+existing Unit LCD command. Use `READ_ID` byte 2 (`MODEL_ID`) to detect the
+product, not the firmware version. Multi-byte values below use big-endian byte order.
 The complete Chinese protocol specification is in
 [`encoder_button_protocol_zh.md`](encoder_button_protocol_zh.md).
 
@@ -48,7 +49,7 @@ duplicate, stale, or out-of-order ACK has no effect. A short click produces
 `PRESS`, `RELEASE`, then `SINGLE_CLICK` after the fixed 300 ms double-click
 window. A double click produces `PRESS`, `RELEASE`, `PRESS`, `RELEASE`, and
 `DOUBLE_CLICK`, without single-click events. A long press produces `PRESS`,
-`LONG_PRESS`, `RELEASE`. Rotation reports unaccelerated `+1` or `-1` steps. The signed
+`LONG_PRESS`, `RELEASE`. Rotation reports unaccelerated `+1` or `-1` per quadrature edge (two counts per mechanical detent). The signed
 position saturates at the int32 limits.
 
 The fixed queue contains 64 events. When full, the oldest event is discarded,

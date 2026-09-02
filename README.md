@@ -5,9 +5,9 @@ Arduino/PlatformIO firmware for M5Stack Unit LCD Plus with ESP32-C61.
 This project is adapted from
 [`M5Unit-LCD-Internal-FW`](https://github.com/m5stack/M5Unit-LCD-Internal-FW)
 at commit `6b345872f033dc85fd56e7af722b31583a587a88`. The Unit LCD I2C protocol
-and default address (`0x3E`) remain compatible. Firmware 0.5 adds a compatible
-encoder and button protocol in the previously unused `0xB0` through `0xB5`
-range.
+and default address (`0x3E`) remain compatible. Unit LCD Plus (`READ_ID`
+byte 2 `MODEL_ID` = 1) adds a compatible encoder and button protocol in the
+previously unused `0xB0` through `0xB5` range.
 
 ## Build
 
@@ -15,9 +15,9 @@ PlatformIO environments:
 
 | Environment | Purpose |
 | --- | --- |
-| `release` | Production internal firmware, version 0.5 |
-| `iap_test` | Temporary version 0.6 image for online-update validation |
-| `debug` | Debug build of the internal firmware |
+| `release`, `esp32_release` | Production internal firmware, shared version 5 |
+| `iap_test`, `esp32_iap_test` | Temporary shared version 6 image for online-update validation |
+| `debug`, `esp32_debug` | Debug build of shared version 5 (`READ_ID` reports `0x85`) |
 
 ```bash
 pio run -e release
