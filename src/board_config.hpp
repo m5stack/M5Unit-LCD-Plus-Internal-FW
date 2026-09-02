@@ -23,7 +23,7 @@ namespace board_config
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
   static constexpr gpio_num_t PIN_ENCODER_A = GPIO_NUM_2;
   static constexpr gpio_num_t PIN_ENCODER_B = GPIO_NUM_3;
-  static constexpr gpio_num_t PIN_ENCODER_BUTTON = GPIO_NUM_4;
+  static constexpr gpio_num_t PIN_ENCODER_BUTTON = GPIO_NUM_9;
 
   static constexpr gpio_num_t PIN_I2C_SDA = GPIO_NUM_5;
   static constexpr gpio_num_t PIN_I2C_SCL = GPIO_NUM_6;
