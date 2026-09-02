@@ -20,18 +20,25 @@ namespace i2c_slave
     std::uint32_t rx_bytes;
     std::uint32_t tx_fifo_events;
     std::uint32_t tx_bytes;
+    std::uint32_t tx_capacity_violations;
     std::uint32_t stretch_address;
     std::uint32_t stretch_tx_empty;
     std::uint32_t stretch_other;
+    std::uint32_t rx_backpressure_holds;
+    std::uint32_t rx_backpressure_timeouts;
   };
 
   bool init(int i2c_num, int pin_sda, int pin_scl, std::uint8_t i2c_addr, void* main_handle, int interrupt_flags);
   bool is_busy(void);
   void start_isr(void);
   void stop_isr(void);
+  void shutdown(void);
   void reset(void);
-  void add_txdata(const std::uint8_t* buf, std::size_t len);
-  void add_txdata(std::uint8_t buf);
+  // On the C61, resumes RX that was held after the main task processed one queue entry.
+  // No-op on the original ESP32.
+  void resume_rx(void);
+  // Reads the free FIFO space and writes everything through a 32-byte DRAM staging buffer.
+  void fill_txdata(void);
   void clear_txdata(void);
   void get_diagnostics(diagnostics_t* diagnostics);
 }

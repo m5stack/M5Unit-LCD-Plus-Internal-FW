@@ -16,5 +16,6 @@ namespace update
   bool addData(std::uint8_t data);
   void setBlockCRC32(std::uint32_t crc32);
   bool checkCRC32(void);
+  void discardBlock(void);
   bool end(void);
 }

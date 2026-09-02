@@ -6,6 +6,8 @@
 #include <driver/ledc.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <soc/soc_caps.h>
+#include <cstdlib>
 #include <cstring>
 
 #include <Arduino.h>
@@ -26,21 +28,43 @@
 namespace command_processor
 {
   static constexpr char NVS_KEY_I2CADDR[] = "ADDR";
-  static constexpr std::uint8_t read_id_data[] = { 0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION };
+  /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
+  /// arriving during an OTA flash write (cache disabled) would panic.
+  static const DRAM_ATTR std::uint8_t read_id_data[] = {
+    0x77, 0x89, static_cast<std::uint8_t>(board_config::MODEL_ID), READ_ID_FIRMWARE_VERSION
+  };
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
   static constexpr std::uint8_t I2C_MIN_ADDR = 0x08;
   static constexpr std::uint8_t I2C_MAX_ADDR = 0x77;
-  static constexpr std::size_t RX_BUFFER_MAX = 0x2000;
+  static constexpr std::size_t RX_BUFFER_MAX = board_config::RX_QUEUE_CAPACITY;
+  static constexpr std::size_t ADVERTISED_FLOW_WINDOW = board_config::ADVERTISED_FLOW_WINDOW;
   static constexpr std::size_t PARAM_MAXLEN = 12;
+  static_assert((RX_BUFFER_MAX & (RX_BUFFER_MAX - 1)) == 0,
+                "RX queue capacity must remain a power of two for ring masks");
+  static_assert(ADVERTISED_FLOW_WINDOW <= RX_BUFFER_MAX,
+                "Advertised flow window must fit in the physical RX queue");
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+  // Reserve the FIFO worst case (32 one-byte commands) plus the current parser slot at
+  // the tail of the queue so a read address match under backpressure can parse the whole hardware RX FIFO.
+  static constexpr std::size_t RX_DRAIN_PARSER_SLOTS = 1;
+  static constexpr std::size_t RX_BACKPRESSURE_RESERVE = SOC_I2C_FIFO_LEN + 2;
+  static_assert(SOC_I2C_FIFO_LEN + RX_DRAIN_PARSER_SLOTS
+                  == RX_BACKPRESSURE_RESERVE - 1,
+                "Backpressure reserve must admit a worst-case FIFO drain");
+  static_assert(RX_BUFFER_MAX > RX_BACKPRESSURE_RESERVE,
+                "RX queue must reserve one hardware FIFO for read freshness");
+  static_assert(ADVERTISED_FLOW_WINDOW + RX_BACKPRESSURE_RESERVE
+                  >= RX_BUFFER_MAX + 4,
+                "Backpressure must begin before READ_BUFCOUNT clamps to one");
+#endif
 
 
   volatile std::size_t _rx_buffer_setpos = 0;
   volatile std::size_t _rx_buffer_getpos = 0;
 
   std::uint8_t _rx_buffer[RX_BUFFER_MAX][PARAM_MAXLEN];
-
   std::uint8_t* _params = _rx_buffer[0];
   std::size_t _param_index = 0;
   std::size_t _param_need_count = 1;
@@ -48,6 +72,9 @@ namespace command_processor
   std::size_t _rle_abs = 0;
   std::uint32_t _argb8888 = ~0u;
   std::uint8_t _i2c_addr = I2C_DEFAULT_ADDR;
+  /// New address requested by CHANGE_ADDR. _i2c_addr itself is not changed until the NVS
+  /// save result is known, so operation continues on the current address if the save fails.
+  std::uint8_t _i2c_addr_request = 0;
   lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI _spi_bus;
   LGFX_Device _lcd;
@@ -55,6 +82,9 @@ namespace command_processor
   bool _byteswap = false;
 
   bool _modified = true;
+  // Guard so the ISR never reads the unallocated sprite when READ_RAW arrives before the canvas exists.
+  // The window exists because the I2C slave is armed before the LCD is initialized.
+  volatile bool _canvas_ready = false;
   bool _dirty_valid = false;
   std::uint_fast16_t _dirty_xs = 0;
   std::uint_fast16_t _dirty_ys = 0;
@@ -63,6 +93,14 @@ namespace command_processor
   bool _partial_flush_enabled = true;
 
   bool _nvs_push = false;
+
+  /// Total commands dropped because the RX queue was full (incremented in the ISR, shown in diagnostics)
+  volatile std::uint32_t _rx_dropped_count = 0;
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+  // Normally the transport stops RX at the high-water mark that reserves the whole hardware
+  // FIFO and the parser slot. Even if the queue does fill up, a completed command is never dropped.
+  volatile bool _rx_pending_enqueue = false;
+#endif
 
   static inline void mark_modified(void)
   {
@@ -127,13 +165,32 @@ namespace command_processor
     finish ,        // 全行程終了
   };
   firmupdate_state_t _firmupdate_state = nothing;
+  static constexpr TickType_t FIRMUPDATE_INACTIVITY_TIMEOUT_TICKS = pdMS_TO_TICKS(5000);
+  volatile TickType_t _firmupdate_last_activity_tick = 0;
   std::size_t _firmupdate_index = 0;
   std::size_t _firmupdate_totalsize = 0;
   std::size_t _firmupdate_result = 0;
   std::size_t _last_command = 0;
+  static constexpr std::size_t TX_RESPONSE_SNAPSHOT_CAPACITY = 10;
+  static_assert(sizeof(read_id_data) <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "READ_ID response must fit in the TX snapshot");
+#if UNIT_LCD_HAS_ENCODER
+  static_assert(unit_lcd_plus_protocol::ENCODER_STATE_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "encoder state response must fit in the TX snapshot");
+  static_assert(unit_lcd_plus_protocol::ENCODER_EVENT_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "encoder event response must fit in the TX snapshot");
+  static_assert(unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "button config response must fit in the TX snapshot");
+#endif
+  std::uint8_t _tx_response_snapshot[TX_RESPONSE_SNAPSHOT_CAPACITY] = { 0xff };
+  std::size_t _tx_response_length = 1;
+  std::size_t _tx_response_cursor = 0;
+  std::uint8_t _tx_response_command = lgfx::Panel_M5UnitLCD::CMD_NOP;
+#if UNIT_LCD_HAS_ENCODER
   std::uint8_t _encoder_state_response[unit_lcd_plus_protocol::ENCODER_STATE_SIZE] = {};
   std::uint8_t _encoder_event_response[unit_lcd_plus_protocol::ENCODER_EVENT_SIZE] = {};
   std::uint8_t _button_config_response[unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE] = {};
+#endif
 
   std::uint_fast8_t _brightness = 128;
   bool _backlight_pwm_attached = false;
@@ -143,6 +200,10 @@ namespace command_processor
     constexpr ledc_mode_t speed_mode = LEDC_LOW_SPEED_MODE;
     constexpr ledc_timer_t timer = LEDC_TIMER_0;
     constexpr ledc_channel_t channel = LEDC_CHANNEL_0;
+
+    const std::uint32_t duty = board_config::LCD_BACKLIGHT_INVERTED
+                             ? 255u - brightness
+                             : brightness;
 
     if (!_backlight_pwm_attached)
     {
@@ -159,7 +220,7 @@ namespace command_processor
       channel_config.channel = channel;
       channel_config.intr_type = LEDC_INTR_DISABLE;
       channel_config.timer_sel = timer;
-      channel_config.duty = brightness;
+      channel_config.duty = duty;
       channel_config.hpoint = 0;
 
       _backlight_pwm_attached = ledc_timer_config(&timer_config) == ESP_OK
@@ -167,28 +228,58 @@ namespace command_processor
     }
 
     if (_backlight_pwm_attached
-     && ledc_set_duty(speed_mode, channel, brightness) == ESP_OK
+     && ledc_set_duty(speed_mode, channel, duty) == ESP_OK
      && ledc_update_duty(speed_mode, channel) == ESP_OK)
     {
       return;
     }
 
     gpio_set_direction(board_config::PIN_LCD_BL, GPIO_MODE_OUTPUT);
-    gpio_set_level(board_config::PIN_LCD_BL, brightness ? 1 : 0);
+    const bool enabled_level = board_config::LCD_BACKLIGHT_INVERTED ? false : true;
+    gpio_set_level(board_config::PIN_LCD_BL, brightness ? enabled_level : !enabled_level);
   }
 
   static void flush_canvas_to_lcd(void)
   {
-    // Keep the original, known-good framebuffer commit path. The sprite
-    // buffer is already in the panel's native 24-bit stream format.
-    _lcd.startWrite();
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      _lcd.startWrite();
+    }
     _lcd.setWindow(0, 0, board_config::LCD_WIDTH - 1,
                    board_config::LCD_HEIGHT - 1);
     _spi_bus.writeBytes(static_cast<const std::uint8_t*>(_canvas.getBuffer()),
-                        _canvas.bufferLength(), true, false);
-    _lcd.endWrite();
+                        _canvas.bufferLength(), true, true);
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      // The original ESP32 M5GFX path releases its DMA workaround here.
+      _lcd.endWrite();
+    }
     _dirty_valid = false;
   }
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+  static void setup_i2c_on_core0(void* main_handle)
+  {
+    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
+                                             board_config::PIN_I2C_SDA,
+                                             board_config::PIN_I2C_SCL,
+                                             _i2c_addr,
+                                             main_handle,
+                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
+             i2c_init_ok,
+             _i2c_addr,
+             board_config::PIN_I2C_SDA,
+             gpio_get_level(board_config::PIN_I2C_SDA),
+             board_config::PIN_I2C_SCL,
+             gpio_get_level(board_config::PIN_I2C_SCL));
+    if (!i2c_init_ok)
+    {
+      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
+    }
+    vTaskDelete(nullptr);
+  }
+#endif
 
   std::uint_fast16_t _xs = 0;
   std::uint_fast16_t _xe = 0;
@@ -211,25 +302,36 @@ namespace command_processor
   std::uint8_t cmd_detect[256] = {0};
   #endif
 
-  static void IRAM_ATTR save_nvs(void)
+  /// Saves the address to NVS. Returns true only if open / set / commit all succeed.
+  static bool IRAM_ATTR save_nvs(std::uint8_t addr)
   {
     i2c_slave::stop_isr();
 // #if DEBUG == 1
 // lgfx::gpio_hi(0);
 // #endif
 
-    std::uint32_t handle = 0;
-    nvs_open(LOGNAME, NVS_READWRITE, &handle);
-
-    nvs_set_u8(handle, NVS_KEY_I2CADDR, _i2c_addr);
-
-    nvs_commit(handle);
-    nvs_close(handle);
+    bool result = false;
+    {
+#if UNIT_LCD_HAS_ENCODER
+      // An NVS commit also disables the cache. Drain the running ISR with the shared guard and
+      // re-anchor to the GPIO state afterwards so transitions before and after are not joined wrongly.
+      encoder_input::flash_guard_t encoder_flash_guard;
+#endif
+      std::uint32_t handle = 0;
+      result = (ESP_OK == nvs_open(LOGNAME, NVS_READWRITE, &handle));
+      if (result)
+      {
+        result = (ESP_OK == nvs_set_u8(handle, NVS_KEY_I2CADDR, addr))
+              && (ESP_OK == nvs_commit(handle));
+        nvs_close(handle);
+      }
+    }
     i2c_slave::start_isr();
 
 // #if DEBUG == 1
 // lgfx::gpio_lo(0);
 // #endif
+    return result;
   }
 
   static void IRAM_ATTR update_argb8888(const std::uint8_t* data, std::size_t len)
@@ -273,7 +375,7 @@ namespace command_processor
       }
       ESP_LOGI(LOGNAME, "done.");
 
-      save_nvs();
+      save_nvs(_i2c_addr);
     }
     else  
     {
@@ -288,11 +390,13 @@ namespace command_processor
 
   static void IRAM_ATTR set_power_mode(std::uint8_t mode)
   {
-    switch (mode)
+    constexpr std::size_t mode_count = sizeof(board_config::CPU_POWER_MIN_MHZ)
+                                     / sizeof(board_config::CPU_POWER_MIN_MHZ[0]);
+    if (mode < mode_count)
     {
-    case 0:  cpu_clock::set_clock_limit(cpu_clock::clock_40MHz,  cpu_clock::clock_40MHz ); break;
-    case 1:  cpu_clock::set_clock_limit(cpu_clock::clock_80MHz,  cpu_clock::clock_160MHz); break;
-    case 2:  cpu_clock::set_clock_limit(cpu_clock::clock_160MHz, cpu_clock::clock_160MHz); break;
+      cpu_clock::set_clock_limit(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MIN_MHZ[mode]),
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MAX_MHZ[mode]));
     }
   }
 
@@ -325,10 +429,15 @@ namespace command_processor
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
-
-      save_nvs();
-
-      esp_restart();
+      /// Reboot only once the NVS save (through commit) is confirmed. If the save failed,
+      /// keep running on the current address. _nvs_push must be cleared here, otherwise
+      /// READ_BUFCOUNT stays stuck at 1.
+      if (save_nvs(_i2c_addr_request))
+      {
+        i2c_slave::shutdown();
+        esp_restart();
+      }
+      _nvs_push = false;
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_INVON:
@@ -564,7 +673,6 @@ namespace command_processor
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_BEGIN:
       _modified = false;
       cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
-      update::initCRCtable();
       _lcd.fillScreen(TFT_WHITE);
       _lcd.drawString("update", 0, 0);
       _lcd.fillRect(10, 112, _lcd.width() - 20, 17, TFT_BLACK);
@@ -573,6 +681,12 @@ namespace command_processor
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
+      // A block with a CRC mismatch is discarded in the ISR and never enters sector_write.
+      // Even if that command is still in the queue, do not overwrite BROKEN with BUSY/ERROR.
+      if (_firmupdate_state != firmupdate_state_t::sector_write)
+      {
+        break;
+      }
       _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BUSY;
       _modified = false;
       ESP_LOGI(LOGNAME, "flash:%d", _firmupdate_index);
@@ -585,7 +699,6 @@ namespace command_processor
       {
         _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_OK;
       }
-
       _firmupdate_state = firmupdate_state_t::wait_data;
       _firmupdate_index += update::BLOCK_SIZE;
       _lcd.fillCircle( 10 + (_lcd.width() - 20) * _firmupdate_index / _firmupdate_totalsize, 120, 4, TFT_GREEN );
@@ -598,6 +711,7 @@ namespace command_processor
         _lcd.drawString("success", 0, 144);
         ESP_LOGI(LOGNAME, "success! rebooting...");
         lgfx::delay(1000);
+        i2c_slave::shutdown();
         esp_restart();
       }
       else
@@ -608,7 +722,29 @@ namespace command_processor
     }
 
     _rx_buffer_getpos = (_rx_buffer_getpos + 1) & (RX_BUFFER_MAX - 1);
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // The C61 ISR stops the RX watermark at the queue high-water mark. Notify the transport
+    // right after freeing one entry so FIFO processing and SCL resume if they were held.
+    i2c_slave::resume_rx();
+#endif
     return true;
+  }
+
+  /// Orientation of the splash. The panel is a 135 x 240 portrait, so the model name only
+  /// fits when drawn in landscape (240 x 135). The host coordinate system stays at rotation 0.
+  static constexpr std::uint8_t SPLASH_ROTATION = 1;
+
+  /// Splash screen. Takes a base-class reference so the same picture is drawn on both the panel and the canvas.
+  static void drawSplash(lgfx::LovyanGFX& gfx)
+  {
+    gfx.setFont(&fonts::Font4);
+    gfx.setCursor(0, 0);
+    gfx.printf("Addr : 0x%02x", _i2c_addr);
+    gfx.setCursor(0, 45);
+    gfx.printf("%s", board_config::MODEL_NAME);
+    gfx.setCursor(0, 90);
+    gfx.printf("FW : %u%s", static_cast<unsigned>(FIRMWARE_VERSION),
+               FIRMWARE_DEBUG ? " debug" : "");
   }
 
   void setup(void)
@@ -617,6 +753,48 @@ namespace command_processor
 
     load_nvs();
 
+    // UPDATE_BEGIN runs in the main task and the following UPDATE_DATA in the ISR, so building
+    // the table between commands would race. Build it once at boot before the I2C interrupt is installed.
+    update::initCRCtable();
+
+    // Arm the I2C slave before initializing the LCD. The released driver gives up its probe
+    // 300 ms + 8 x 32 ms after CMD_RESET, so the later the slave is armed the closer existing
+    // hosts get to that timeout. Draw commands that arrive before the LCD is ready stay in
+    // the RX queue and are processed once loop() starts. READ_RAW before the canvas exists
+    // returns 0 through the _canvas_ready guard.
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // On the original, keep the I2C ISR on core 0 as before, separate from the Arduino loop on core 1.
+    if (xTaskCreatePinnedToCore(setup_i2c_on_core0,
+                               "i2cSetup",
+                               8192,
+                               xTaskGetCurrentTaskHandle(),
+                               0,
+                               nullptr,
+                               0) != pdPASS)
+    {
+      ESP_LOGE(LOGNAME, "I2C setup task creation failed");
+    }
+#else
+    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
+                                             board_config::PIN_I2C_SDA,
+                                             board_config::PIN_I2C_SCL,
+                                             _i2c_addr,
+                                             xTaskGetCurrentTaskHandle(),
+                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
+    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
+             i2c_init_ok,
+             _i2c_addr,
+             board_config::PIN_I2C_SDA,
+             gpio_get_level(board_config::PIN_I2C_SDA),
+             board_config::PIN_I2C_SCL,
+             gpio_get_level(board_config::PIN_I2C_SCL));
+    if (!i2c_init_ok)
+    {
+      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
+    }
+#endif
+
+
 #if DEBUG == 1
     lgfx::pinMode(0, lgfx::pin_mode_t::output);
     lgfx::gpio_hi(0);
@@ -624,14 +802,14 @@ namespace command_processor
 
     {
       auto cfg = _spi_bus.config();
-      cfg.spi_host = SPI2_HOST;
-      // C61's current generic GDMA path can stall during full-frame transfers.
-      // Disable DMA so M5GFX uses its synchronous register conversion path.
-      cfg.dma_channel = 0;
+      cfg.spi_host = board_config::LCD_SPI_HOST;
+      // The C61 uses the AHB_DMA fixed in M5GFX 0.2.27; the original ESP32 keeps
+      // DMA channel 2 as shipped.
+      cfg.dma_channel = board_config::LCD_DMA_CHANNEL;
       cfg.freq_write = 40000000;
       cfg.freq_read  = 14000000;
       cfg.pin_mosi = board_config::PIN_LCD_MOSI;
-      cfg.pin_miso = -1;
+      cfg.pin_miso = board_config::PIN_LCD_MISO;
       cfg.pin_sclk = board_config::PIN_LCD_SCLK;
       cfg.pin_dc   = board_config::PIN_LCD_DC;
       cfg.spi_3wire = true;
@@ -656,15 +834,15 @@ namespace command_processor
     ESP_LOGI(LOGNAME, "LCD init=%d", lcd_init_ok);
     _lcd.startWrite();
     ESP_LOGI(LOGNAME, "LCD startWrite complete");
+    // Only the splash is drawn in landscape. The panel is a 135 x 240 portrait and the model
+    // name in Font4 would be cut off. The coordinate system exposed to the host stays at
+    // rotation 0, so restore it afterwards (the default orientation seen by the protocol is unchanged).
+    _lcd.setRotation(SPLASH_ROTATION);
     _lcd.fillScreen(TFT_WHITE);
     ESP_LOGI(LOGNAME, "LCD fillScreen complete");
     _lcd.setTextColor(TFT_BLACK, TFT_WHITE);
 
-    _lcd.setFont(&fonts::Font4);
-    _lcd.setCursor(0,0);
-    _lcd.printf("Addr : 0x%02x", _i2c_addr);
-    _lcd.setCursor(0,216);
-    _lcd.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
+    drawSplash(_lcd);
     ESP_LOGI(LOGNAME, "LCD startup text complete");
     _lcd.setColorDepth(24);
     _canvas.setColorDepth (24);
@@ -673,50 +851,47 @@ namespace command_processor
     _modified = false;
     _lcd.setRotation(0);
     _lcd.setWindow(0, 0, _lcd.width()-1, _lcd.height()-1);
-    _canvas.createSprite(_lcd.width(), _lcd.height());
-    _canvas.setRotation(0);
+    const auto canvas_width = _lcd.width();
+    const auto canvas_height = _lcd.height();
+    if (_canvas.createSprite(canvas_width, canvas_height) == nullptr)
+    {
+      ESP_LOGE(LOGNAME, "LCD canvas allocation failed: %d x %d x 3 bytes",
+               static_cast<int>(canvas_width), static_cast<int>(canvas_height));
+      abort();
+    }
     // The splash was drawn directly to the panel. Mirror it into the backing
     // store so the first partial host update starts from the same frame.
+    // Draw in the same orientation as the panel, then return to rotation 0. The sprite rotation
+    // only changes the coordinate transform while drawing, so the picture stays after restoring it.
+    _canvas.setRotation(SPLASH_ROTATION);
     _canvas.fillScreen(TFT_WHITE);
     _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
-    _canvas.setFont(&fonts::Font4);
-    _canvas.setCursor(0, 0);
-    _canvas.printf("Addr : 0x%02x", _i2c_addr);
-    _canvas.setCursor(0, 216);
-    _canvas.printf("Ver : %0d.%0d", FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION);
+    drawSplash(_canvas);
+    _canvas.setRotation(0);
     _dirty_valid = false;
-    _lcd.endWrite();
-    ESP_LOGI(LOGNAME, "LCD canvas complete");
+    _canvas_ready = true;
+    if constexpr (!board_config::LCD_ASYNC_DMA)
+    {
+      _lcd.endWrite();
+    }
+    ESP_LOGI(LOGNAME, "LCD canvas complete; asynchronous DMA=%d",
+             board_config::LCD_ASYNC_DMA);
 
     cpu_clock::init();
-    cpu_clock::request_clock_down(cpu_clock::clock_80MHz);
+    cpu_clock::request_clock_down(
+      static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_POWER_MIN_MHZ[1]));
     set_power_mode(1);
     ESP_LOGI(LOGNAME, "CPU clock setup complete");
 
+#if UNIT_LCD_HAS_ENCODER
     const bool encoder_init_ok = encoder_input::setup();
     ESP_LOGI(LOGNAME, "Encoder init=%d A=%d B=%d button=%d",
              encoder_init_ok,
              board_config::PIN_ENCODER_A,
              board_config::PIN_ENCODER_B,
              board_config::PIN_ENCODER_BUTTON);
+#endif
 
-    const bool i2c_init_ok = i2c_slave::init(I2C_PORT,
-                                             board_config::PIN_I2C_SDA,
-                                             board_config::PIN_I2C_SCL,
-                                             _i2c_addr,
-                                             xTaskGetCurrentTaskHandle(),
-                                             ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3);
-    ESP_LOGI(LOGNAME, "I2C slave init=%d addr=0x%02x SDA=%d(level=%d) SCL=%d(level=%d)",
-             i2c_init_ok,
-             _i2c_addr,
-             board_config::PIN_I2C_SDA,
-             gpio_get_level(board_config::PIN_I2C_SDA),
-             board_config::PIN_I2C_SCL,
-             gpio_get_level(board_config::PIN_I2C_SCL));
-    if (!i2c_init_ok)
-    {
-      ESP_LOGE(LOGNAME, "I2C slave initialization failed");
-    }
   /*
     auto ms = lgfx::millis();
     lgfx::pinMode(0, lgfx::pin_mode_t::input_pullup);
@@ -731,6 +906,7 @@ namespace command_processor
           nvs_close(handle);
         }
         while (!lgfx::gpio_in(0) || !lgfx::gpio_in(1) || !lgfx::gpio_in(3)) lgfx::delay(10);
+        i2c_slave::shutdown();
         esp_restart();
       }
       taskYIELD();
@@ -752,16 +928,20 @@ namespace command_processor
     {
       last_diagnostic_interrupts = diagnostics.interrupts;
       ESP_LOGI(LOGNAME,
-               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u stretch(addr=%u tx=%u other=%u) cmd=0x%02x",
+               "I2C diag irq=%u status=0x%08x rx=%u txevt=%u txbytes=%u txcap=%u stretch(addr=%u tx=%u other=%u) backpressure(hold=%u timeout=%u) cmd=0x%02x dropped=%u",
                diagnostics.interrupts,
                diagnostics.last_status,
                diagnostics.rx_bytes,
                diagnostics.tx_fifo_events,
                diagnostics.tx_bytes,
+               diagnostics.tx_capacity_violations,
                diagnostics.stretch_address,
                diagnostics.stretch_tx_empty,
                diagnostics.stretch_other,
-               static_cast<unsigned>(_last_command));
+               diagnostics.rx_backpressure_holds,
+               diagnostics.rx_backpressure_timeouts,
+               static_cast<unsigned>(_last_command),
+               static_cast<unsigned>(_rx_dropped_count));
     }
     bool processed_command = false;
     while (command())
@@ -770,21 +950,24 @@ namespace command_processor
     }
     if (!processed_command && !_modified && _firmupdate_state == firmupdate_state_t::nothing)
     {
-      cpu_clock::request_clock_down(cpu_clock::clock_40MHz);
-      // Address persistence and OTA deliberately suppress ISR task notifications
-      // while flash is involved. Poll briefly so those queued commands cannot
-      // leave the single-core C61 main task asleep indefinitely.
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
-      cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
+      cpu_clock::request_clock_down(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_IDLE_MHZ));
+      // The C61 polls in case notifications are suppressed during flash work; the dual-core
+      // original blocks until notified as shipped and keeps its 20 MHz idle.
+      const TickType_t wait_ticks = board_config::IDLE_POLL_INTERVAL_MS
+                                  ? pdMS_TO_TICKS(board_config::IDLE_POLL_INTERVAL_MS)
+                                  : portMAX_DELAY;
+      ulTaskNotifyTake(pdTRUE, wait_ticks);
+      cpu_clock::request_clock_up(
+        static_cast<cpu_clock::cpu_clock_t>(board_config::CPU_ACTIVE_MHZ));
     }
     // The framebuffer is committed after the commands currently available in
-    // the RX queue have been applied. Only the accumulated dirty rectangle is
-    // transferred, so a local update never sends or clears the whole screen.
+    // the RX queue have been applied. C61 leaves DMA running asynchronously;
+    // the original ESP32 closes the transaction to release M5GFX's DMA guard.
     if (_modified && !_spi_bus.busy())
     {
       _modified = false;
-      // M5GFX's generic C61 GDMA path does not complete reliably. Send the
-      // panel's native 24-bit stream through the synchronous register path.
+      // The panel's native 24-bit stream can be transferred without conversion.
       flush_canvas_to_lcd();
     }
   }
@@ -797,9 +980,147 @@ namespace command_processor
     _param_resetindex = 0;
   }
 
+  static inline void IRAM_ATTR markFirmupdateActivity(void)
+  {
+    _firmupdate_last_activity_tick = xTaskGetTickCountFromISR();
+  }
+
+  static inline void IRAM_ATTR expireAbandonedFirmupdate(void)
+  {
+    if (_firmupdate_state == firmupdate_state_t::nothing || !_nvs_push || _param_index != 0) return;
+    const TickType_t now = xTaskGetTickCountFromISR();
+    if (now - _firmupdate_last_activity_tick < FIRMUPDATE_INACTIVITY_TIMEOUT_TICKS) return;
+
+    // Abandon the session if no IAP byte arrives for 5 seconds. Clearing only _nvs_push would
+    // let a partial payload or UPDATE_END be processed as the old session, so close the state and parser too.
+    // If the parser is mid-command, do not close yet; defer expiry to the next command boundary.
+    // Recovering a few bytes late is safer than splitting an in-flight, order-dependent draw command.
+    // The check is a tick comparison in the ISR when the next write byte arrives; no timer task or logging.
+    _nvs_push = false;
+    _firmupdate_state = firmupdate_state_t::nothing;
+    closeData();
+  }
+
+  bool IRAM_ATTR rxNeedsBackpressure(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    if (_rx_pending_enqueue) return true;
+    const auto free_slots = (_rx_buffer_getpos - _rx_buffer_setpos) & (RX_BUFFER_MAX - 1);
+    // Under sustained backpressure a 1-byte read command still lands at the tail of the hardware FIFO.
+    // Stop at a reserve that lets the whole FIFO be parsed in order down to the reply command.
+    return free_slots != 0 && free_slots <= RX_BACKPRESSURE_RESERVE;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR rxCanDrainReadCommand(std::size_t rx_bytes)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    if (_rx_pending_enqueue) return false;
+    auto free_slots = (_rx_buffer_getpos - _rx_buffer_setpos) & (RX_BUFFER_MAX - 1);
+    if (free_slots == 0) free_slots = RX_BUFFER_MAX;
+    // Keep the current parser slot even in the worst case where every byte completes a command.
+    return free_slots > rx_bytes + RX_DRAIN_PARSER_SLOTS;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR rxCanCaptureReadCommand(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // The IAP payload arrives in a single write transaction; while in progress every byte goes
+    // to the current UPDATE_DATA. If a status read starts while the last byte is still in the
+    // FIFO at the high-water mark, leave it for the normal parser drain instead of taking it as a command.
+    // During sector_write the host reads without resending the command, so keep the latest
+    // UPDATE_DATA and return live status.
+    return _firmupdate_state != firmupdate_state_t::progress
+        && _firmupdate_state != firmupdate_state_t::sector_write;
+#else
+    return false;
+#endif
+  }
+
+  bool IRAM_ATTR tryAcceptReadCommand(std::uint8_t value)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // While a completed command is parked in the parser slot, addData() must not overwrite
+    // its first byte. Hand the byte back to the deferred path of the transport.
+    if (_rx_pending_enqueue) return false;
+    switch (value)
+    {
+    case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+#if UNIT_LCD_HAS_ENCODER
+    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+#endif
+      // Apply the Sr of W->Sr->R as a parser boundary first, then complete only the 1-byte read
+      // command, which consumes no queue entry, through the normal addData path.
+      closeData();
+      addData(value);
+      return true;
+
+    default:
+      return false;
+    }
+#else
+    return false;
+#endif
+  }
+
+  static bool IRAM_ATTR enqueueCompletedCommand(void)
+  {
+    const auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
+    if (new_setpos == _rx_buffer_getpos)
+    {
+      return false;
+    }
+    _rx_buffer_setpos = new_setpos;
+    _param_index = _param_resetindex;
+    for (std::size_t i = 0; i < _param_resetindex; ++i)
+    {
+      _rx_buffer[new_setpos][i] = _params[i];
+    }
+    _params = _rx_buffer[new_setpos];
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    _rx_pending_enqueue = false;
+#endif
+    return true;
+  }
+
+  bool IRAM_ATTR retryPendingRxCommand(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    return !_rx_pending_enqueue || enqueueCompletedCommand();
+#else
+    return true;
+#endif
+  }
+
+  void IRAM_ATTR discardRxForBackpressureTimeout(void)
+  {
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    _rx_dropped_count = _rx_dropped_count + 1;
+    if ((_param_index != 0 || _rx_pending_enqueue)
+     && _params[0] == lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR)
+    {
+      _nvs_push = false;
+    }
+    _rx_pending_enqueue = false;
+    closeData();
+#endif
+  }
+
   /// I2CペリフェラルISRから1Byteずつデータを受取る処理
   bool IRAM_ATTR addData(std::uint8_t value)
   {
+    expireAbandonedFirmupdate();
     _params[_param_index] = value;
 
     if (++_param_index == 1)
@@ -820,12 +1141,17 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
       case lgfx::Panel_M5UnitLCD::CMD_INVOFF:
       case lgfx::Panel_M5UnitLCD::CMD_INVON:
+      // RAM_FILL was missing from the classifier and became a NOP as an undefined command before reaching the executor.
+      // CMD_SET_COLOR shares the value 0x50, so accept it under the RAM_FILL name as a 1-byte command without a duplicate case.
+      case lgfx::Panel_M5UnitLCD::CMD_RAM_FILL:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
       case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
       case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+#endif
         _param_need_count = 1;
         break;
 
@@ -899,6 +1225,7 @@ namespace command_processor
         _param_need_count = 8;
         return false;
 
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_ACK_ENCODER_EVENT:
       case unit_lcd_plus_protocol::CMD_SET_BUTTON_CONFIG:
         _param_need_count = 3;
@@ -907,7 +1234,17 @@ namespace command_processor
       case unit_lcd_plus_protocol::CMD_SET_ENCODER_POSITION:
         _param_need_count = 5;
         return false;
+#endif
       }
+    }
+
+    // Only UPDATE_DATA/END write bytes count as IAP activity. Plain status reads and
+    // READ_BUFCOUNT polls do not extend the deadline; a legitimately slow block extends it on every byte.
+    if (_firmupdate_state != firmupdate_state_t::nothing
+     && (_params[0] == lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA
+      || _params[0] == lgfx::Panel_M5UnitLCD::CMD_UPDATE_END))
+    {
+      markFirmupdateActivity();
     }
     else
     if (_param_index == 3 && (_params[0] & ~7) == lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE)
@@ -933,7 +1270,11 @@ namespace command_processor
 
     if (_param_index >= _param_need_count)
     {
+#if defined(CONFIG_IDF_TARGET_ESP32)
+      // The original cannot wait on a read address match, so keep prefetching when the command completes.
       i2c_slave::clear_txdata();
+      beginTxResponse();
+#endif
       switch (_params[0])
       {
       default:
@@ -949,6 +1290,7 @@ namespace command_processor
          && (_params[0] == _params[3])
         )
         {
+          i2c_slave::shutdown();
           esp_restart();
           break;
         }
@@ -961,6 +1303,9 @@ namespace command_processor
         )
         {
           _firmupdate_state = firmupdate_state_t::wait_data;
+          // Throttling starts with the first UPDATE_DATA header, so a session with only BEGIN
+          // never expires. Hosts that need more than 5 s to prepare SD/network are accepted, and
+          // a wait_data left behind stays the unthrottled behaviour it always was.
           _firmupdate_index = 0;
           _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_ERROR; /// 途中中断した時のためリード応答にはエラーステートを設定しておく
           _firmupdate_totalsize = _params[4] << 24 | _params[5] << 16 | _params[6] << 8 | _params[7];
@@ -987,17 +1332,29 @@ namespace command_processor
           if (update::checkCRC32())
           {
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BUSY;
+            _firmupdate_state = firmupdate_state_t::sector_write;
           }
           else
           {
+            // A block with a CRC mismatch is not queued; wait for a resend at the same offset.
+            // BROKEN stays the live reply until the next UPDATE_DATA header or UPDATE_BEGIN.
             _firmupdate_result = lgfx::Panel_M5UnitLCD::UPDATE_RESULT_BROKEN;
+            update::discardBlock();
+            _firmupdate_state = firmupdate_state_t::wait_data;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+            i2c_slave::fill_txdata();
+#endif
+            closeData();
+            return false;
           }
-          prepareTxData();
-          _firmupdate_state = sector_write;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+          i2c_slave::fill_txdata();
+#endif
           closeData();
         }
         else
-        if ((_params[1] == 0x77)
+        if ((_firmupdate_state != firmupdate_state_t::nothing)
+         && (_params[1] == 0x77)
          && (_params[2] == 0x89)
          && (_params[0] == _params[3])
         )
@@ -1018,17 +1375,39 @@ namespace command_processor
         }
         break;
 
-      case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
-        if (_params[0] == _params[3]
-         && _params[1] == (0xFF & ~_params[2])
-         && _params[1] >= I2C_MIN_ADDR
-         && _params[1] <= I2C_MAX_ADDR
-         && _params[1] != _i2c_addr
+      /// Firmware update completion command
+      case lgfx::Panel_M5UnitLCD::CMD_UPDATE_END:
+        /// Discard without queueing when the magic mismatches or UPDATE_BEGIN has not run
+        /// (invalid commands have no side effect). Previously update::end() ran unchecked and a
+        /// unit without UPDATE_BEGIN rebooted on an esp_partition_write assert.
+        if ((_params[1] != 0x77)
+         || (_params[2] != 0x89)
+         || (_params[0] != _params[3])
+         || (_firmupdate_state == firmupdate_state_t::nothing)
         )
         {
-          _i2c_addr = _params[1];
-          _nvs_push = true;
+          closeData();
+          return false;
         }
+        break;
+
+      case lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR:
+        /// A request that fails the validity rules (section 13.1: range, complement, matching
+        /// head and tail, different from the current address) is discarded without queueing
+        /// (invalid commands have no side effect). Previously save_nvs + esp_restart ran even
+        /// for invalid requests, rebooting without changing the address.
+        if (_params[0] != _params[3]
+         || _params[1] != (0xFF & ~_params[2])
+         || _params[1] < I2C_MIN_ADDR
+         || _params[1] > I2C_MAX_ADDR
+         || _params[1] == _i2c_addr
+        )
+        {
+          closeData();
+          return false;
+        }
+        _i2c_addr_request = _params[1];
+        _nvs_push = true;
         break;
 
       case lgfx::Panel_M5UnitLCD::CMD_CASET:
@@ -1044,27 +1423,36 @@ namespace command_processor
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
       case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
-        _read_xptr = _read_xs;
-        _read_yptr = _read_ys;
-        prepareTxData();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
       case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
-        prepareTxData();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
+#if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
         encoder_input::read_state(_encoder_state_response);
-        prepareTxData();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        beginTxResponse();
+        i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
       case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
         encoder_input::peek_event(_encoder_event_response);
-        prepareTxData();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        beginTxResponse();
+        i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
@@ -1080,7 +1468,10 @@ namespace command_processor
 
       case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
         encoder_input::read_button_config(_button_config_response);
-        prepareTxData();
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        beginTxResponse();
+        i2c_slave::fill_txdata();
+#endif
         closeData();
         return false;
 
@@ -1088,16 +1479,35 @@ namespace command_processor
         encoder_input::set_button_config(unit_lcd_plus_protocol::read_u16_be(&_params[1]));
         closeData();
         return false;
+#endif
       }
 
-      auto new_setpos = (_rx_buffer_setpos + 1) & (RX_BUFFER_MAX - 1);
-      _rx_buffer_setpos = new_setpos;
-      _param_index = _param_resetindex;
-      for (std::size_t i = 0; i < _param_resetindex; ++i)
+      /// Queue insertion. The C61 stops the transport at a high-water mark that leaves room for
+      /// the whole FIFO and the parser slot, so the queue normally never fills. If it does, the
+      /// completed command is parked until main frees an entry. The original ESP32 cannot
+      /// stretch on address match, so it drops the new command as before. Old commands are kept
+      /// because drawing is order dependent and stopping after command N is self-consistent.
+      if (!enqueueCompletedCommand())
       {
-        _rx_buffer[new_setpos][i] = _params[i];
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+        // Normally unreachable thanks to the reserved slots. Even when completely full, keep the
+        // completed command in the parser slot and hold the transport until main frees an entry.
+        _rx_pending_enqueue = true;
+        return _nvs_push ? false : true;
+#else
+        _rx_dropped_count = _rx_dropped_count + 1;
+        if (_params[0] == lgfx::Panel_M5UnitLCD::CMD_CHANGE_ADDR)
+        {
+          /// Leaving _nvs_push set for a dropped CHANGE_ADDR would keep READ_BUFCOUNT stuck
+          /// at 1, so forget the request entirely
+          _nvs_push = false;
+        }
+        /// The parser continues in the current slot. The prefix of a variable-length command
+        /// (_param_resetindex bytes) is still in the current slot, so no copy is needed.
+        _param_index = _param_resetindex;
+        return false;
+#endif
       }
-      _params = _rx_buffer[new_setpos];
 
 
       // NVS領域やファームウェアへの書き込みはタスク通知を使うとクラッシュするのでfalseを返す
@@ -1106,22 +1516,68 @@ namespace command_processor
     return false;
   }
 
-  void IRAM_ATTR prepareTxData(void)
+  void IRAM_ATTR beginTxResponse(void)
   {
-    static constexpr std::uint8_t dummy[] = { 0xff, 0xff };
-    switch (_last_command)
+    _tx_response_command = static_cast<std::uint8_t>(_last_command);
+    _tx_response_cursor = 0;
+    _tx_response_length = 1;
+    _tx_response_snapshot[0] = 0xff;
+
+    switch (_tx_response_command)
     {
     default:
-      i2c_slave::add_txdata(dummy, 1);
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
-      i2c_slave::add_txdata(read_id_data, sizeof(read_id_data));
+      _tx_response_length = sizeof(read_id_data);
+      memcpy(_tx_response_snapshot, read_id_data, _tx_response_length);
       break;
 
-    case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
-      i2c_slave::add_txdata(_firmupdate_result);
+#if UNIT_LCD_HAS_ENCODER
+    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
+      _tx_response_length = sizeof(_encoder_state_response);
+      memcpy(_tx_response_snapshot, _encoder_state_response, _tx_response_length);
       break;
+
+    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
+      _tx_response_length = sizeof(_encoder_event_response);
+      memcpy(_tx_response_snapshot, _encoder_event_response, _tx_response_length);
+      break;
+
+    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
+      _tx_response_length = sizeof(_button_config_response);
+      memcpy(_tx_response_snapshot, _button_config_response, _tx_response_length);
+      break;
+#endif
+
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
+    case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
+      _tx_response_length = 0;
+      // Sections 3.3/12 define pixel continuity within a single read transaction, with the
+      // read pointer starting at the top-left of the window. The released host readRect() also
+      // reads everything in one readBytes, so on the C61 the cursor is deliberately returned to
+      // the window start on every address match; it does not continue across plain reads.
+      _read_xptr = _read_xs;
+      _read_yptr = _read_ys;
+      break;
+    }
+  }
+
+  std::size_t IRAM_ATTR produceTx(std::uint8_t* destination, std::size_t capacity)
+  {
+    if (destination == nullptr || capacity == 0)
+    {
+      return 0;
+    }
+
+    switch (_tx_response_command)
+    {
+    // The released host sends the command once and then repeats plain reads waiting for the
+    // value to change, so these two replies are re-evaluated on every refill instead of snapshotted at begin.
+    case lgfx::Panel_M5UnitLCD::CMD_UPDATE_DATA:
+      destination[0] = static_cast<std::uint8_t>(_firmupdate_result);
+      return 1;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
       {
@@ -1136,63 +1592,83 @@ namespace command_processor
           std::int32_t gp = _rx_buffer_getpos;
           if (sp != gp)
           {
-            //std::int32_t buf_free = ((int)(getBufferFree() + 512) - rxbuffer_max) >> 1;
+            // READ_BUFCOUNT advertises free space of the 512-entry window shared with the
+            // released host in units of 2 entries, not the whole physical queue. The 0..255
+            // semantics seen by the host stay the same even though queue sizes differ per target.
             std::int32_t buf_free = gp - sp;
             if (buf_free > 0) buf_free -= RX_BUFFER_MAX;
-            // 
-            buf_free = (buf_free + 512) >> 1;
-            res = std::max<std::int32_t>(1, std::min<std::int32_t>(254, buf_free));
+            //
+            buf_free = (buf_free + ADVERTISED_FLOW_WINDOW) >> 1;
+            if (buf_free < 1)
+            {
+              res = 1;
+            }
+            else if (buf_free > 254)
+            {
+              res = 254;
+            }
+            else
+            {
+              res = static_cast<std::uint32_t>(buf_free);
+            }
           }
         }
-        i2c_slave::add_txdata((std::uint8_t*)&res, 1);
+        destination[0] = static_cast<std::uint8_t>(res);
+        return 1;
       }
-      break;
-
-    case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
-      i2c_slave::add_txdata(_encoder_state_response, sizeof(_encoder_state_response));
-      break;
-
-    case unit_lcd_plus_protocol::CMD_PEEK_ENCODER_EVENT:
-      i2c_slave::add_txdata(_encoder_event_response, sizeof(_encoder_event_response));
-      break;
-
-    case unit_lcd_plus_protocol::CMD_READ_BUTTON_CONFIG:
-      i2c_slave::add_txdata(_button_config_response, sizeof(_button_config_response));
-      break;
 
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
-      for (std::size_t i = 0; i < 8; ++i)
       {
-        std::uint32_t res = _canvas.readPixelValue(_read_xptr, _read_yptr);
-        std::size_t bytes = _last_command & 3;
-        switch (bytes)
+        const std::size_t bytes_per_pixel = _tx_response_command & 3;
+        const std::size_t available_pixels = capacity / bytes_per_pixel;
+        const std::size_t pixel_count = available_pixels < 8 ? available_pixels : 8;
+        std::size_t produced = 0;
+        for (std::size_t i = 0; i < pixel_count; ++i)
         {
-          case 2: res = lgfx::color_convert<lgfx::swap565_t, lgfx::bgr888_t>(res); break;
-          case 1: res = lgfx::color_convert<lgfx::rgb332_t, lgfx::bgr888_t>(res); break;
-          default: break;
-        }
-        if (_byteswap)
-        {
-          switch (bytes)
+          std::uint32_t res = _canvas_ready
+                            ? _canvas.readPixelValue(_read_xptr, _read_yptr)
+                            : 0;
+          switch (bytes_per_pixel)
           {
-            case 3: res = lgfx::getSwap24(res); break;
-            case 2: res = lgfx::getSwap16(res); break;
+            case 2: res = lgfx::color_convert<lgfx::swap565_t, lgfx::bgr888_t>(res); break;
+            case 1: res = lgfx::color_convert<lgfx::rgb332_t, lgfx::bgr888_t>(res); break;
             default: break;
           }
-        }
-        i2c_slave::add_txdata((std::uint8_t*)&res, bytes);
-        if (++_read_xptr > _read_xe)
-        {
-          _read_xptr = _read_xs;
-          if (++_read_yptr > _read_ye)
+          if (_byteswap)
           {
-            _read_yptr = _read_ys;
+            switch (bytes_per_pixel)
+            {
+              case 3: res = lgfx::getSwap24(res); break;
+              case 2: res = lgfx::getSwap16(res); break;
+              default: break;
+            }
+          }
+          memcpy(destination + produced, &res, bytes_per_pixel);
+          produced += bytes_per_pixel;
+          if (++_read_xptr > _read_xe)
+          {
+            _read_xptr = _read_xs;
+            if (++_read_yptr > _read_ye)
+            {
+              _read_yptr = _read_ys;
+            }
           }
         }
+        return produced;
       }
-      break;
+
+    default:
+      {
+        if (_tx_response_length == 0) return 0;
+        if (_tx_response_cursor == _tx_response_length) _tx_response_cursor = 0;
+        const auto remaining = _tx_response_length - _tx_response_cursor;
+        const auto produced = capacity < remaining ? capacity : remaining;
+        memcpy(destination, _tx_response_snapshot + _tx_response_cursor, produced);
+        _tx_response_cursor += produced;
+        return produced;
+      }
     }
   }
 }
