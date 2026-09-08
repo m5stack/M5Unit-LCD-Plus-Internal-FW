@@ -24,7 +24,10 @@ pio run -e release
 pio run -e iap_test
 ```
 
-Direct USB flashing uses 921600 baud:
+Direct USB flashing uses 921600 baud. The encoder button is wired to GPIO9,
+the ESP32-C61 download-boot strapping pin (active low). Hold the encoder
+button while powering on to enter Joint Download Boot if USB auto-download
+is unavailable:
 
 ```bash
 pio run -e release -t upload --upload-port /dev/ttyACM0
@@ -44,7 +47,7 @@ address, reset, and IAP protocol. See `docs/encoder_button_protocol_zh.md` or
 | LCD RST / D-C | 23 / 22 |
 | LCD MOSI / SCLK / CS | 28 / 27 / 26 |
 | LCD backlight enable | 25, active high |
-| Encoder A / B / button | 2 / 3 / 4 |
+| Encoder A / B / button | 2 / 3 / 9 |
 
 The internal canvas uses a three-byte RGB stream for compatibility with the
 original firmware. M5GFX programs the ST7789 with `COLMOD=0x66`, so the panel

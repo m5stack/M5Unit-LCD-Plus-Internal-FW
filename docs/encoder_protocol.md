@@ -62,5 +62,6 @@ double-click window, and a configurable 500..5000 ms long-press threshold that
 defaults to 500 ms. `READ_BUTTON_CONFIG` returns the threshold as uint16 BE;
 `SET_BUTTON_CONFIG` accepts command plus uint16 BE. Invalid values have no
 effect, and reset restores 500 ms. Encoder A/B/button use ESP32-C61
-GPIO2/GPIO3/GPIO4; the button is
-active low with internal pull-ups enabled.
+GPIO2/GPIO3/GPIO9; the button is
+active low with internal pull-ups enabled. GPIO9 is also the download-boot
+strapping pin, so holding the button at power-on enters Joint Download Boot.
