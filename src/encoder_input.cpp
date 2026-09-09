@@ -43,13 +43,23 @@ namespace encoder_input
       std::int32_t position;
     };
 
+    // Keep this queue independent from the 64-entry host queue. A 32-entry
+    // local queue absorbs a short input burst while the UI task renders and
+    // costs only 256 bytes of static DRAM.
+    constexpr std::uint8_t LOCAL_QUEUE_CAPACITY = 32;
+
     portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
     esp_timer_handle_t timer = nullptr;
     event_t events[ENCODER_QUEUE_CAPACITY] = {};
+    local_event_t local_events[LOCAL_QUEUE_CAPACITY] = {};
     std::uint8_t queue_head = 0;
     std::uint8_t queue_count = 0;
+    std::uint8_t local_queue_head = 0;
+    std::uint8_t local_queue_count = 0;
+    std::int8_t local_rotation_accumulator = 0;
     std::uint16_t next_sequence = 0;
     std::uint16_t dropped_count = 0;
+    std::uint16_t local_dropped_count = 0;
     std::int32_t position = 0;
     std::uint8_t encoder_code = 0;
     bool button_pressed = false;
@@ -74,6 +84,51 @@ namespace encoder_input
       return flags;
     }
 
+    std::uint8_t IRAM_ATTR local_state_flags_locked()
+    {
+      std::uint8_t flags = 0;
+      if (button_pressed) flags |= ENCODER_FLAG_BUTTON_PRESSED;
+      if (button_long_pressed) flags |= ENCODER_FLAG_BUTTON_LONG_PRESSED;
+      if (local_queue_count != 0) flags |= ENCODER_FLAG_EVENT_PENDING;
+      if (local_dropped_count != 0) flags |= ENCODER_FLAG_OVERFLOW;
+      return flags;
+    }
+
+    void IRAM_ATTR push_local_event_locked(std::uint8_t type, std::int16_t delta)
+    {
+      if (type == ENCODER_EVENT_ROTATE)
+      {
+        local_rotation_accumulator = static_cast<std::int8_t>(
+          local_rotation_accumulator + delta);
+        if (local_rotation_accumulator > -2 && local_rotation_accumulator < 2)
+        {
+          return;
+        }
+        delta = local_rotation_accumulator > 0 ? 1 : -1;
+        local_rotation_accumulator = static_cast<std::int8_t>(
+          local_rotation_accumulator - delta * 2);
+      }
+
+      if (local_queue_count == LOCAL_QUEUE_CAPACITY)
+      {
+        local_queue_head = static_cast<std::uint8_t>(
+          (local_queue_head + 1) % LOCAL_QUEUE_CAPACITY);
+        --local_queue_count;
+        if (local_dropped_count != UINT16_MAX) ++local_dropped_count;
+      }
+
+      const auto tail = static_cast<std::uint8_t>(
+        (local_queue_head + local_queue_count) % LOCAL_QUEUE_CAPACITY);
+      local_events[tail] = {
+        .type = type,
+        .flags = static_cast<std::uint8_t>(local_state_flags_locked()
+                                            | ENCODER_FLAG_EVENT_PENDING),
+        .delta = delta,
+        .position = position,
+      };
+      ++local_queue_count;
+    }
+
     void IRAM_ATTR push_event_locked(std::uint8_t type, std::int16_t delta)
     {
       if (queue_count == ENCODER_QUEUE_CAPACITY)
@@ -92,6 +147,9 @@ namespace encoder_input
         .position = position,
       };
       ++queue_count;
+      // Mirror the event after the host record is complete. The two queues have
+      // independent cursors, so local polling cannot consume a host event.
+      push_local_event_locked(type, delta);
     }
 
     std::int32_t IRAM_ATTR saturated_add(std::int32_t value, std::int16_t delta)
@@ -353,6 +411,10 @@ namespace encoder_input
     queue_head = 0;
     queue_count = 0;
     dropped_count = 0;
+    local_queue_head = 0;
+    local_queue_count = 0;
+    local_rotation_accumulator = 0;
+    local_dropped_count = 0;
     single_click_pending = false;
     click_window_samples = 0;
     portEXIT_CRITICAL_ISR(&lock);
@@ -376,6 +438,35 @@ namespace encoder_input
     portENTER_CRITICAL_ISR(&lock);
     long_press_ms = new_long_press_ms;
     portEXIT_CRITICAL_ISR(&lock);
+  }
+
+  bool poll_local_event(local_event_t* response)
+  {
+    if (response == nullptr) return false;
+
+    portENTER_CRITICAL(&lock);
+    if (local_queue_count == 0)
+    {
+      portEXIT_CRITICAL(&lock);
+      return false;
+    }
+
+    *response = local_events[local_queue_head];
+    local_queue_head = static_cast<std::uint8_t>(
+      (local_queue_head + 1) % LOCAL_QUEUE_CAPACITY);
+    --local_queue_count;
+    portEXIT_CRITICAL(&lock);
+    return true;
+  }
+
+  void clear_local_events(void)
+  {
+    portENTER_CRITICAL(&lock);
+    local_queue_head = 0;
+    local_queue_count = 0;
+    local_rotation_accumulator = 0;
+    local_dropped_count = 0;
+    portEXIT_CRITICAL(&lock);
   }
 }
 
