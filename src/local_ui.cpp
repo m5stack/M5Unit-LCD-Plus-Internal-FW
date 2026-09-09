@@ -70,7 +70,7 @@ namespace local_ui
       switch (command_processor::local_ui_theme())
       {
         case 0: return unit_lcd_ui::variant_t::precision;
-        case 2: return unit_lcd_ui::variant_t::console;
+        // Legacy Console (2) and unknown values use the Light palette.
         default: return unit_lcd_ui::variant_t::utility;
       }
     }
@@ -116,10 +116,8 @@ namespace local_ui
           break;
 
         case unit_lcd_plus_protocol::ENCODER_EVENT_LONG_PRESS:
-          // Long press is the physical back gesture. The controller clears
-          // its pressed state, so the following RELEASE cannot activate the
-          // newly exposed row a second time.
-          controller.dispatch(unit_lcd_ui::action_t::back);
+          // Long holds are ignored by the UI and disarm the release click.
+          controller.dispatch(unit_lcd_ui::action_t::long_press);
           break;
 
         default:
@@ -168,7 +166,8 @@ namespace local_ui
 
   bool init(LGFX_Device& lcd,
             std::uint8_t address,
-            std::uint8_t firmware_version,
+            std::uint8_t firmware_major,
+            std::uint8_t firmware_minor,
             bool debug_build)
   {
     if (active) return true;
@@ -190,7 +189,8 @@ namespace local_ui
 
     unit_lcd_ui::device_info_t info;
     info.address = address;
-    info.firmware_version = firmware_version;
+    info.firmware_major = firmware_major;
+    info.firmware_minor = firmware_minor;
     info.debug_build = debug_build;
 
     unit_lcd_ui::callbacks_t callbacks;
@@ -208,6 +208,7 @@ namespace local_ui
       return false;
     }
 
+    controller.show_boot_logo();
     active = true;
     ownership_stopped = false;
     address_result_applied = false;

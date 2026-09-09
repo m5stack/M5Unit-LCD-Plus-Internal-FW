@@ -38,7 +38,7 @@ namespace command_processor
   /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
   /// arriving during an OTA flash write (cache disabled) would panic.
   static const DRAM_ATTR std::uint8_t read_id_data[] = {
-    0x77, 0x89, static_cast<std::uint8_t>(board_config::MODEL_ID), READ_ID_FIRMWARE_VERSION
+    0x77, 0x89, FIRMWARE_MAJOR_VERSION, READ_ID_FIRMWARE_MINOR
   };
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
@@ -268,7 +268,7 @@ namespace command_processor
   std::uint8_t _button_config_response[unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE] = {};
 #endif
 
-  std::uint_fast8_t _brightness = 128;
+  std::uint_fast8_t _brightness = 204;  // Default backlight: 80% of 255.
   bool _backlight_pwm_attached = false;
 
   static void set_backlight(std::uint8_t brightness)
@@ -964,7 +964,8 @@ namespace command_processor
     gfx.setCursor(0, 45);
     gfx.printf("%s", board_config::MODEL_NAME);
     gfx.setCursor(0, 90);
-    gfx.printf("FW : %u%s", static_cast<unsigned>(FIRMWARE_VERSION),
+    gfx.printf("FW : %u.%u%s", static_cast<unsigned>(FIRMWARE_MAJOR_VERSION),
+               static_cast<unsigned>(FIRMWARE_MINOR_VERSION),
                FIRMWARE_DEBUG ? " debug" : "");
   }
 
@@ -1063,7 +1064,9 @@ namespace command_processor
     ESP_LOGI(LOGNAME, "LCD fillScreen complete");
     _lcd.setTextColor(TFT_BLACK, TFT_WHITE);
 
+#if !defined(CONFIG_IDF_TARGET_ESP32C61)
     drawSplash(_lcd);
+#endif
     ESP_LOGI(LOGNAME, "LCD startup text complete");
     _lcd.setColorDepth(24);
     _canvas.setColorDepth (24);
@@ -1116,9 +1119,17 @@ namespace command_processor
 #if defined(CONFIG_IDF_TARGET_ESP32C61)
     const bool local_ui_init_ok = local_ui::init(_lcd,
                                                  _i2c_addr,
-                                                 FIRMWARE_VERSION,
+                                                 FIRMWARE_MAJOR_VERSION,
+                                                 FIRMWARE_MINOR_VERSION,
                                                  FIRMWARE_DEBUG);
     ESP_LOGI(LOGNAME, "Local utility UI init=%d", local_ui_init_ok);
+    if (!local_ui_init_ok)
+    {
+      // Retain the legacy information screen if the LVGL UI cannot start.
+      _lcd.setRotation(SPLASH_ROTATION);
+      drawSplash(_lcd);
+      _lcd.setRotation(0);
+    }
 #endif
 
   /*

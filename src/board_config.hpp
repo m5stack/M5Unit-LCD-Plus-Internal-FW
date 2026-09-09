@@ -53,7 +53,7 @@ namespace board_config
   static constexpr std::uint16_t IDLE_POLL_INTERVAL_MS = 1;
   static constexpr model_id_t MODEL_ID = model_id_t::unit_lcd_plus;
   static constexpr char MODEL_NAME[] = "Unit LCD Plus";
-  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = UNIT_LCD_DEFAULT_FIRMWARE_VERSION;
+  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = FIRMWARE_MINOR_VERSION;
   // The C61 clock-stretches at the queue high-water mark, so a queue deeper than the
   // 512-entry flow-control window the host uses is unnecessary. Returning static DRAM
   // to the heap guarantees a contiguous stack for the OTA task.
@@ -89,7 +89,7 @@ namespace board_config
   // The shipped original already returns 0 in READ_ID byte 2; keep that value as its model id.
   static constexpr model_id_t MODEL_ID = model_id_t::unit_lcd;
   static constexpr char MODEL_NAME[] = "Unit LCD";
-  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = UNIT_LCD_DEFAULT_FIRMWARE_VERSION;
+  static constexpr std::uint8_t DEFAULT_FIRMWARE_VERSION = FIRMWARE_MINOR_VERSION;
   // So the original can hold the canvas and the command queue at once, keep the queue in
   // static DRAM but shrink it to 0x1000 entries, still far above the 512 entries advertised by READ_BUFCOUNT.
   static constexpr std::size_t RX_QUEUE_CAPACITY = 0x1000;

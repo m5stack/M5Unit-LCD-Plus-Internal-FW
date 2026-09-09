@@ -11,7 +11,8 @@ namespace local_ui
   // the I2C ISR; all LVGL work remains in the Arduino owner task.
   bool init(LGFX_Device& lcd,
             std::uint8_t address,
-            std::uint8_t firmware_version,
+            std::uint8_t firmware_major,
+            std::uint8_t firmware_minor,
             bool debug_build);
 
   void handle(void);

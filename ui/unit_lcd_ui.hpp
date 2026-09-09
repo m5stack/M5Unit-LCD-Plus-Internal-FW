@@ -10,9 +10,9 @@ namespace unit_lcd_ui
 {
   enum class variant_t : std::uint8_t
   {
-    precision,
-    utility,
-    console,
+    precision,  // Persisted ID 0: Dark.
+    utility,    // Persisted ID 1: Light.
+    console,    // Legacy ID 2: normalized to Light when loaded.
   };
 
   enum class action_t : std::uint8_t
@@ -21,14 +21,16 @@ namespace unit_lcd_ui
     next,
     press,
     release,
-    back,
+    long_press,
   };
 
     enum class preview_state_t : std::uint8_t
     {
+      boot_logo,
       home,
       pressed,
       address_edit,
+      address_adjust,
       address_confirm,
       address_saving,
       address_saved,
@@ -40,7 +42,8 @@ namespace unit_lcd_ui
   struct device_info_t
   {
     std::uint8_t address = 0x3E;
-    std::uint8_t firmware_version = 5;
+    std::uint8_t firmware_major = 1;
+    std::uint8_t firmware_minor = 1;
     bool debug_build = false;
   };
 
@@ -65,6 +68,7 @@ namespace unit_lcd_ui
     bool create(lv_obj_t* parent, variant_t variant,
                 const device_info_t& info, const callbacks_t& callbacks = {});
     void destroy();
+    void show_boot_logo();
     void dispatch(action_t action);
     void set_address_save_result(bool success);
     void show_preview_state(preview_state_t state);
@@ -74,6 +78,7 @@ namespace unit_lcd_ui
   private:
     enum class screen_t : std::uint8_t
     {
+      boot_logo,
       home,
       address_edit,
       address_confirm,
@@ -120,7 +125,7 @@ namespace unit_lcd_ui
     static const theme_t& theme_for(variant_t variant);
     void init_styles();
     void reset_styles();
-    void build_screen(screen_t screen, bool animate = true);
+    void build_screen(screen_t screen);
     void build_header(lv_obj_t* parent, const char* section);
     void build_home(lv_obj_t* parent);
     void build_address_edit(lv_obj_t* parent);
@@ -139,7 +144,6 @@ namespace unit_lcd_ui
                          std::int16_t width, lv_text_align_t align = LV_TEXT_ALIGN_LEFT);
     lv_obj_t* make_row(lv_obj_t* parent, std::uint8_t index,
                        std::int16_t y, const char* label, const char* value);
-    void start_screen_motion();
     void pump_motion();
     static void motion_timer_callback(lv_timer_t* timer);
 
@@ -153,7 +157,7 @@ namespace unit_lcd_ui
     lv_obj_t* content_ = nullptr;
     lv_obj_t* selector_block_ = nullptr;
     lv_obj_t* address_flow_ = nullptr;
-    lv_obj_t* address_label_ = nullptr;
+    lv_obj_t* address_chars_[6] = {};
     lv_timer_t* motion_timer_ = nullptr;
     hex_digit_flow_t address_digits_[2];
     smooth_ui_toolkit::AnimateValue selector_y_;
@@ -161,6 +165,9 @@ namespace unit_lcd_ui
     lv_obj_t* row_labels_[3] = {};
     lv_obj_t* row_values_[3] = {};
     std::int16_t row_y_[3] = {};
+    std::int16_t row_height_[3] = {};
+    bool address_adjusting_ = false;
+    std::uint32_t boot_started_ = 0;
     std::uint8_t row_count_ = 0;
     std::uint8_t selection_ = 0;
     std::uint8_t pending_address_ = 0x3E;

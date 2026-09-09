@@ -23,7 +23,8 @@ namespace unit_lcd_ui
     // Line 0 and 17 render 'F'/'0'; lines 1..16 render '0'..'F'.
     static constexpr std::uint8_t LIST_SIZE = 18;
 
-    bool create(lv_obj_t* parent, const lv_font_t* font, std::uint32_t text_color)
+    bool create(lv_obj_t* parent, const lv_font_t* font, std::uint32_t text_color,
+                std::int32_t slot_width = 0)
     {
       if (parent == nullptr || font == nullptr) return false;
       font_ = font;
@@ -34,6 +35,8 @@ namespace unit_lcd_ui
         const auto advance = lv_font_get_glyph_width(font_, DIGITS[i], DIGITS[i]);
         if (advance > column_width_) column_width_ = advance;
       }
+
+      if (slot_width > column_width_) column_width_ = slot_width;
 
       column_ = lv_obj_create(parent);
       if (column_ == nullptr) return false;
@@ -79,6 +82,18 @@ namespace unit_lcd_ui
       column_ = nullptr;
       label_ = nullptr;
       font_ = nullptr;
+    }
+
+    void set_color(std::uint32_t text_color)
+    {
+      if (label_ != nullptr) lv_obj_set_style_text_color(label_, lv_color_hex(text_color), 0);
+    }
+
+    // Used only when a partially created pair must fall back to static slots.
+    void destroy()
+    {
+      if (column_ != nullptr) lv_obj_delete(column_);
+      reset();
     }
 
     bool created() const { return column_ != nullptr; }

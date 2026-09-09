@@ -29,6 +29,7 @@ namespace
     bool save_succeeds = true;
     bool report_memory = false;
     bool smoke = false;
+    std::uint8_t firmware_version = 1;
   };
 
   struct app_t
@@ -71,9 +72,11 @@ namespace
       unit_lcd_ui::preview_state_t state;
     };
     constexpr mapping_t mappings[] = {
+      { "boot", unit_lcd_ui::preview_state_t::boot_logo },
       { "home", unit_lcd_ui::preview_state_t::home },
       { "pressed", unit_lcd_ui::preview_state_t::pressed },
       { "edit", unit_lcd_ui::preview_state_t::address_edit },
+      { "adjust", unit_lcd_ui::preview_state_t::address_adjust },
       { "confirm", unit_lcd_ui::preview_state_t::address_confirm },
       { "saving", unit_lcd_ui::preview_state_t::address_saving },
       { "saved", unit_lcd_ui::preview_state_t::address_saved },
@@ -95,9 +98,9 @@ namespace
   void print_usage(const char* executable)
   {
     std::printf(
-      "Usage: %s [--variant precision|utility|console] "
-      "[--state home|pressed|edit|confirm|saving|saved|error|about|theme] "
-      "[--capture FILE.bmp] [--zoom SCALE] [--fail-save] [--stats] [--smoke]\n",
+      "Usage: %s [--variant light|dark] "
+      "[--state boot|home|pressed|edit|adjust|confirm|saving|saved|error|about|theme] "
+      "[--capture FILE.bmp] [--firmware-version 0..127] [--zoom SCALE] [--fail-save] [--stats] [--smoke]\n",
       executable);
   }
 
@@ -116,6 +119,13 @@ namespace
       else if (std::strcmp(argv[i], "--capture") == 0 && i + 1 < argc)
       {
         options->capture_path = argv[++i];
+      }
+      else if (std::strcmp(argv[i], "--firmware-version") == 0 && i + 1 < argc)
+      {
+        char* end = nullptr;
+        const auto version = std::strtoul(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || version > 127) return false;
+        options->firmware_version = static_cast<std::uint8_t>(version);
       }
       else if (std::strcmp(argv[i], "--zoom") == 0 && i + 1 < argc)
       {
@@ -211,7 +221,7 @@ namespace
           break;
         case SDLK_ESCAPE:
         case SDLK_BACKSPACE:
-          if (event->key.repeat == 0) app->push(unit_lcd_ui::action_t::back);
+          if (event->key.repeat == 0) app->push(unit_lcd_ui::action_t::long_press);
           break;
         case SDLK_q:
           app->running = false;
@@ -266,6 +276,26 @@ namespace
     const auto save_result = read_result == 0 ? SDL_SaveBMP(surface, path) : -1;
     SDL_FreeSurface(surface);
     return save_result == 0;
+  }
+
+  lv_obj_t* find_label(lv_obj_t* object, const char* text)
+  {
+    if (lv_obj_check_type(object, &lv_label_class)
+        && std::strcmp(lv_label_get_text(object), text) == 0) return object;
+    for (std::uint32_t i = 0; i < lv_obj_get_child_count(object); ++i)
+      if (auto* found = find_label(lv_obj_get_child(object, i), text)) return found;
+    return nullptr;
+  }
+
+  bool has_label(lv_obj_t* object, const char* text)
+  {
+    if (lv_obj_check_type(object, &lv_label_class)
+        && std::strcmp(lv_label_get_text(object), text) == 0) return true;
+    for (std::uint32_t i = 0; i < lv_obj_get_child_count(object); ++i)
+    {
+      if (has_label(lv_obj_get_child(object, i), text)) return true;
+    }
+    return false;
   }
 
   bool validate_layout(lv_obj_t* object)
@@ -340,7 +370,7 @@ int main(int argc, char** argv)
   app.save_succeeds = options.save_succeeds;
   unit_lcd_ui::device_info_t info;
   info.address = 0x3E;
-  info.firmware_version = 5;
+  info.firmware_minor = options.firmware_version;
   info.debug_build = false;
   unit_lcd_ui::callbacks_t callbacks;
   callbacks.request_address_change = address_change_requested;
@@ -388,46 +418,219 @@ int main(int argc, char** argv)
           std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
       };
+      auto check = [&](bool condition, const char* scenario)
+      {
+        if (!condition) std::fprintf(stderr, "SMOKE failed: %s\n", scenario);
+        smoke_passed = smoke_passed && condition;
+      };
+      app.ui.show_boot_logo();
+      char boot_address[8];
+      char boot_version[12];
+      std::snprintf(boot_address, sizeof(boot_address), "0x%02X", info.address);
+      std::snprintf(boot_version, sizeof(boot_version), "V%u.%u", info.firmware_major, info.firmware_minor);
+      check(has_label(lv_screen_active(), boot_address) && has_label(lv_screen_active(), boot_version),
+            "boot displays current address and actual firmware version");
+      app.ui.dispatch(unit_lcd_ui::action_t::press);
+      app.ui.dispatch(unit_lcd_ui::action_t::release);
+      app.ui.dispatch(unit_lcd_ui::action_t::next);
+      pump(600);
+      check(!has_label(lv_screen_active(), "Unit LCD-Plus") && app.address_requests == 0
+            && app.theme_changes == 0, "boot logo holds and ignores input");
+      pump(500);
+      check(has_label(lv_screen_active(), "Unit LCD-Plus"), "boot advances to home");
+      app.ui.dispatch(unit_lcd_ui::action_t::release);
+      check(has_label(lv_screen_active(), "Unit LCD-Plus"), "boot release does not activate");
+      lv_obj_update_layout(lv_screen_active());
+      auto* initial_title = find_label(lv_screen_active(), "Unit LCD-Plus");
+      const auto* title_font = lv_obj_get_style_text_font(initial_title, LV_PART_MAIN);
+      const auto title_y = lv_obj_get_y(initial_title);
+      auto check_header = [&]
+      {
+        lv_obj_update_layout(lv_screen_active());
+        auto* title = find_label(lv_screen_active(), "Unit LCD-Plus");
+        if (title == nullptr) title = find_label(lv_screen_active(), "SETTING");
+        if (title == nullptr) title = find_label(lv_screen_active(), "Device Info");
+        check(title != nullptr, "header exists");
+        if (title == nullptr) return;
+        auto* content = lv_obj_get_parent(title);
+        check(lv_obj_get_x(content) == 0 && lv_obj_get_y(content) == 0, "page never translated");
+        check(lv_obj_get_y(title) == title_y && lv_obj_get_style_text_font(title, LV_PART_MAIN) == title_font,
+              "fixed title font and y");
+        bool divider = false;
+        for (std::uint32_t i = 0; i < lv_obj_get_child_count(content); ++i)
+        {
+          auto* child = lv_obj_get_child(content, i);
+          if (lv_obj_get_y(child) == 29 && lv_obj_get_height(child) == 1
+              && lv_obj_get_width(child) == DISPLAY_WIDTH) divider = true;
+        }
+        check(divider, "fixed header divider");
+      };
       auto click = [&]
       {
         app.ui.dispatch(unit_lcd_ui::action_t::press);
         app.ui.dispatch(unit_lcd_ui::action_t::release);
+        check_header();                                  // Entry frame
+        pump(80);
+        check_header();                                  // Former transition midpoint
+        pump(120);
+        check_header();                                  // Settled frame
+      };
+      auto check_address = [&](bool editing)
+      {
+        lv_obj_update_layout(lv_screen_active());
+        auto* left = find_label(lv_screen_active(), "<");
+        check(left != nullptr, "address slots exist");
+        if (left == nullptr) return;
+        auto* group = lv_obj_get_parent(left);
+        const auto width = lv_obj_get_width(left);
+        check(lv_obj_get_width(group) == 6 * width
+              && std::abs(2 * lv_obj_get_x(group) + 6 * width - DISPLAY_WIDTH) <= 1,
+              "address centered equal slots");
+        const auto palette = app.theme_changes ? app.last_theme : options.variant;
+        const bool dark = palette == unit_lcd_ui::variant_t::precision;
+        const auto expected = lv_color_to_u32(lv_color_hex(editing ? (dark ? 0x49D17D : 0x238A55)
+                                                                : (dark ? 0xF2F6F5 : 0x17201E)));
+        for (std::uint32_t i = 0; i < 6; ++i)
+        {
+          auto* glyph = lv_obj_get_child(group, i);
+          check(lv_obj_get_x(glyph) == static_cast<int>(i) * width
+                && lv_obj_get_y(glyph) == 0 && lv_obj_get_width(glyph) == width,
+                "equal address character placement");
+          check(lv_color_to_u32(lv_obj_get_style_text_color(glyph, LV_PART_MAIN)) == expected,
+                "uniform address color");
+        }
+        for (std::uint32_t i = 6; i < lv_obj_get_child_count(group); ++i)
+        {
+          auto* column = lv_obj_get_child(group, i);
+          auto* glyph = lv_obj_get_child(column, 0);
+          check(lv_obj_get_width(column) == width
+                && lv_color_to_u32(lv_obj_get_style_text_color(glyph, LV_PART_MAIN)) == expected,
+                "rolling slot width and color");
+        }
+      };
+      auto visible = [&](const char* text) { return has_label(lv_screen_active(), text); };
+      using action = unit_lcd_ui::action_t;
+      auto dispatch = [&](action value) { app.ui.dispatch(value); };
+      // Probe editing through input behavior, not instructional text.
+      auto adjusting = [&]
+      {
+        const auto before = app.ui.pending_address();
+        const bool down = before > 0x08;
+        dispatch(down ? action::previous : action::next);
+        const bool changed = app.ui.pending_address() != before;
+        dispatch(down ? action::next : action::previous);
+        return changed;
+      };
+      auto hold = [&]
+      {
+        dispatch(action::press);
+        dispatch(action::long_press);
+        dispatch(action::release);
         pump(200);
       };
-
-      app.ui.dispatch(unit_lcd_ui::action_t::next);  // Home: DEVICE
-      pump(40);
-      click();                                         // Device info
-      click();                                         // Back to home
-      app.ui.dispatch(unit_lcd_ui::action_t::next);   // Home: THEME
-      pump(40);
-      click();                                         // Theme picker
-      app.ui.dispatch(unit_lcd_ui::action_t::next);   // Picker: next theme
-      pump(40);
-      click();                                         // Apply theme live
-      pump(120);
-      app.ui.dispatch(unit_lcd_ui::action_t::back);   // Picker -> home (THEME)
-      app.ui.dispatch(unit_lcd_ui::action_t::previous); // Home: DEVICE
-      app.ui.dispatch(unit_lcd_ui::action_t::previous); // Home: ADDRESS
-      pump(40);
-      click();                                         // Address editor
-      app.ui.dispatch(unit_lcd_ui::action_t::next);   // 0x3E -> 0x3F
-      pump(40);
-      click();                                         // Confirm
-      click();                                         // Apply / saving
+      check(visible("Unit LCD-Plus"), "home title");
+      hold();
+      check(visible("Unit LCD-Plus"), "home hold must not activate");
+      dispatch(action::previous);                       // Device
+      click();
+      char version[12];
+      std::snprintf(version, sizeof(version), "V%u.%u", info.firmware_major, info.firmware_minor);
+      check(visible("SoC") && visible("4MiB") && visible(version), "device info");
+      hold();
+      check(visible("SoC"), "device hold must not go back");
+      click();                                         // Explicit Back
+      click();
+      check(visible("SoC"), "device return focus");
+      click();
+      dispatch(action::previous);                       // Theme
+      click();
+      check(visible("Light") && visible("Dark") && visible("Back"), "theme has Back");
+      click();
+      check(app.theme_changes == 0, "unchanged theme");
+      // Toggle between the two palettes, avoiding the third Back item.
+      dispatch(options.variant == unit_lcd_ui::variant_t::precision ? action::previous : action::next);
+      hold();
+      check(app.theme_changes == 0 && visible("Light"), "theme hold does not apply or exit");
+      click();
+      const auto expected_theme = options.variant == unit_lcd_ui::variant_t::precision
+                                ? unit_lcd_ui::variant_t::utility
+                                : unit_lcd_ui::variant_t::precision;
+      check(app.theme_changes == 1 && app.last_theme == expected_theme, "theme mapping");
+      if (expected_theme == unit_lcd_ui::variant_t::utility) dispatch(action::previous);
+      else dispatch(action::next);
+      hold();
+      check(visible("Light"), "holding Back must not exit");
+      click();
+      check(visible("Unit LCD-Plus"), "theme Back");
+      click();
+      check(visible("Light"), "theme return focus");
+      if (expected_theme == unit_lcd_ui::variant_t::utility) dispatch(action::previous);
+      else dispatch(action::next);
+      click();
+      dispatch(action::previous);                       // Address
+      click();
+      check((visible("Current") && !adjusting()) && visible("Back"), "address navigation state");
+      check_address(false);
+      const auto original = app.ui.pending_address();
+      dispatch(action::next);                           // Focus Back, no value change
+      check(app.ui.pending_address() == original, "navigation must not edit address");
+      pump(250);
+      check(validate_layout(lv_screen_active()), "address Back focus layout");
+      hold();
+      check(visible("Current"), "holding address Back must not exit");
+      click();
+      check(visible("Unit LCD-Plus"), "address Back");
+      click();
+      hold();
+      check((visible("Current") && !adjusting()), "hold does not enter edit");
+      click();
+      check((visible("Current") && adjusting()), "click starts adjustment");
+      check_address(true);
+      hold();
+      check((visible("Current") && adjusting()) && app.address_requests == 0, "hold does not confirm");
+      for (int i = 0; i < 160; ++i) dispatch(action::previous);
+      check(app.ui.pending_address() == 0x08, "lower bound");
+      for (int i = 0; i < 160; ++i) dispatch(action::next);
+      check(app.ui.pending_address() == 0x77, "upper bound");
+      pump(400);
+      check_address(true);
+      check(validate_layout(lv_screen_active()), "adjust layout");
+      click();
+      check(visible("Applying\nwill reboot!") && app.address_requests == 0, "confirmation does not save");
+      hold();
+      check(visible("Applying\nwill reboot!") && app.address_requests == 0, "hold does not apply");
+      dispatch(action::next);
+      click();                                         // Cancel -> address selection
+      check((visible("Current") && !adjusting()) && app.ui.pending_address() == 0x77, "Cancel returns to field");
+      check_address(false);
+      dispatch(action::next);
+      click();                                         // Back discards pending edit
+      click();
+      check(app.ui.pending_address() == original, "Back discards edit");
+      click();                                         // Start adjustment
+      click();                                         // Confirm unchanged address
+      check(visible("Applying\nwill reboot!") && app.address_requests == 0, "unchanged confirm");
+      dispatch(action::next);
+      click();                                         // Cancel
+      click();                                         // Start adjustment
+      dispatch(action::next);                           // 0x3F
+      click();
+      click();                                         // Apply
       pump(800);
-
-      const auto expected_theme = static_cast<unit_lcd_ui::variant_t>(
-        (static_cast<std::uint8_t>(options.variant) + 1) % 3);
-      smoke_passed = app.address_requests == 1
-                   && app.requested_address == 0x3F
-                   && app.ui.pending_address() == 0x3F
-                   && app.theme_changes == 1
-                   && app.last_theme == expected_theme;
+      check(app.address_requests == 1 && app.requested_address == 0x3F, "one save");
+      check(visible(app.save_succeeds ? "SAVED" : "NOT SAVED"), "save result");
       if (!app.save_succeeds)
       {
-        click();                                       // Error: TRY AGAIN
+        click();                                       // Retry -> address selection
+        check((visible("Current") && !adjusting()) && app.ui.pending_address() == 0x3F, "retry retains value");
+        click();                                       // Start adjustment
+        click();                                       // Confirm
+        click();                                       // Apply
+        pump(800);
+        check(app.address_requests == 2 && visible("NOT SAVED"), "retry save");
       }
+      pump(200);
+      check(validate_layout(lv_screen_active()), "final layout");
     }
     {
       lv_mem_monitor_t memory;
@@ -485,5 +688,5 @@ int main(int argc, char** argv)
     if (!layout_valid) std::fprintf(stderr, "Layout validation failed\n");
     return EXIT_FAILURE;
   }
-  return EXIT_SUCCESS;
+  return smoke_passed ? EXIT_SUCCESS : EXIT_FAILURE;
 }
