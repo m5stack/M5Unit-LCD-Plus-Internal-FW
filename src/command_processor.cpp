@@ -24,14 +24,21 @@
 #include "unit_lcd_plus_protocol.hpp"
 #include "update.hpp"
 #include "command_processor.hpp"
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+#include "local_ui.hpp"
+#endif
 
 namespace command_processor
 {
   static constexpr char NVS_KEY_I2CADDR[] = "ADDR";
+  // Local UI palette index (unit_lcd_ui::variant_t). Utility is the shipping
+  // default; the key only exists once the user changes the theme on device.
+  static constexpr char NVS_KEY_UI_THEME[] = "UI_THEME";
+  static constexpr std::uint8_t UI_THEME_DEFAULT = 1;
   /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
   /// arriving during an OTA flash write (cache disabled) would panic.
   static const DRAM_ATTR std::uint8_t read_id_data[] = {
-    0x77, 0x89, static_cast<std::uint8_t>(board_config::MODEL_ID), READ_ID_FIRMWARE_VERSION
+    0x77, 0x89, FIRMWARE_MAJOR_VERSION, READ_ID_FIRMWARE_MINOR
   };
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
@@ -72,6 +79,7 @@ namespace command_processor
   std::size_t _rle_abs = 0;
   std::uint32_t _argb8888 = ~0u;
   std::uint8_t _i2c_addr = I2C_DEFAULT_ADDR;
+  std::uint8_t _ui_theme = UI_THEME_DEFAULT;
   /// New address requested by CHANGE_ADDR. _i2c_addr itself is not changed until the NVS
   /// save result is known, so operation continues on the current address if the save fails.
   std::uint8_t _i2c_addr_request = 0;
@@ -92,7 +100,17 @@ namespace command_processor
   std::uint_fast16_t _dirty_ye = 0;
   bool _partial_flush_enabled = true;
 
+  // Display ownership starts with the local utility UI.  It is latched to the
+  // host on the first pixel-writing command and remains there until reset.  A
+  // firmware update temporarily supersedes both producers; the update path
+  // always reboots on completion, so no reverse transition is needed.
+  volatile std::uint8_t _display_owner =
+    static_cast<std::uint8_t>(display_owner_t::local_ui);
+
   bool _nvs_push = false;
+  volatile std::uint8_t _local_address_status =
+    static_cast<std::uint8_t>(local_address_status_t::idle);
+  std::uint8_t _local_address_pending = I2C_DEFAULT_ADDR;
 
   /// Total commands dropped because the RX queue was full (incremented in the ISR, shown in diagnostics)
   volatile std::uint32_t _rx_dropped_count = 0;
@@ -105,6 +123,64 @@ namespace command_processor
   static inline void mark_modified(void)
   {
     _modified = true;
+  }
+
+  static inline bool is_pixel_write_command(std::uint8_t command_value)
+  {
+    switch (command_value)
+    {
+      // These session/display preparation commands are part of a host display
+      // transaction too.  They are classified here (rather than in the I2C
+      // ISR) so ownership changes only after a complete, valid command has
+      // been queued and is about to execute.
+      case lgfx::Panel_M5UnitLCD::CMD_INVOFF:
+      case lgfx::Panel_M5UnitLCD::CMD_INVON:
+      case lgfx::Panel_M5UnitLCD::CMD_BRIGHTNESS:
+      case lgfx::Panel_M5UnitLCD::CMD_CASET:
+      case lgfx::Panel_M5UnitLCD::CMD_RASET:
+      case lgfx::Panel_M5UnitLCD::CMD_ROTATE:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_POWER:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_SLEEP:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_BYTESWAP:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_COLOR_8:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_COLOR_16:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_COLOR_24:
+      case lgfx::Panel_M5UnitLCD::CMD_SET_COLOR_32:
+      case lgfx::Panel_M5UnitLCD::CMD_COPYRECT:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_8:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_16:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_24:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_32:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RAW_A:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE_8:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE_16:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE_24:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE_32:
+      case lgfx::Panel_M5UnitLCD::CMD_WRITE_RLE_A:
+      case lgfx::Panel_M5UnitLCD::CMD_RAM_FILL:
+      case lgfx::Panel_M5UnitLCD::CMD_DRAWPIXEL:
+      case lgfx::Panel_M5UnitLCD::CMD_DRAWPIXEL_8:
+      case lgfx::Panel_M5UnitLCD::CMD_DRAWPIXEL_16:
+      case lgfx::Panel_M5UnitLCD::CMD_DRAWPIXEL_24:
+      case lgfx::Panel_M5UnitLCD::CMD_DRAWPIXEL_32:
+      case lgfx::Panel_M5UnitLCD::CMD_FILLRECT:
+      case lgfx::Panel_M5UnitLCD::CMD_FILLRECT_8:
+      case lgfx::Panel_M5UnitLCD::CMD_FILLRECT_16:
+      case lgfx::Panel_M5UnitLCD::CMD_FILLRECT_24:
+      case lgfx::Panel_M5UnitLCD::CMD_FILLRECT_32:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static inline void claim_host_display(std::uint8_t command_value)
+  {
+    if (is_pixel_write_command(command_value)
+     && _display_owner == static_cast<std::uint8_t>(display_owner_t::local_ui))
+    {
+      _display_owner = static_cast<std::uint8_t>(display_owner_t::host_owned);
+    }
   }
 
   static inline void mark_modified_rect(std::int32_t x, std::int32_t y,
@@ -192,7 +268,7 @@ namespace command_processor
   std::uint8_t _button_config_response[unit_lcd_plus_protocol::BUTTON_CONFIG_SIZE] = {};
 #endif
 
-  std::uint_fast8_t _brightness = 128;
+  std::uint_fast8_t _brightness = 204;  // Default backlight: 80% of 255.
   bool _backlight_pwm_attached = false;
 
   static void set_backlight(std::uint8_t brightness)
@@ -302,8 +378,8 @@ namespace command_processor
   std::uint8_t cmd_detect[256] = {0};
   #endif
 
-  /// Saves the address to NVS. Returns true only if open / set / commit all succeed.
-  static bool IRAM_ATTR save_nvs(std::uint8_t addr)
+  /// Saves one key to NVS. Returns true only if open / set / commit all succeed.
+  static bool IRAM_ATTR save_nvs_u8(const char* key, std::uint8_t value)
   {
     i2c_slave::stop_isr();
 // #if DEBUG == 1
@@ -321,7 +397,7 @@ namespace command_processor
       result = (ESP_OK == nvs_open(LOGNAME, NVS_READWRITE, &handle));
       if (result)
       {
-        result = (ESP_OK == nvs_set_u8(handle, NVS_KEY_I2CADDR, addr))
+        result = (ESP_OK == nvs_set_u8(handle, key, value))
               && (ESP_OK == nvs_commit(handle));
         nvs_close(handle);
       }
@@ -332,6 +408,139 @@ namespace command_processor
 // lgfx::gpio_lo(0);
 // #endif
     return result;
+  }
+
+  /// Saves the address to NVS. Returns true only if open / set / commit all succeed.
+  static bool IRAM_ATTR save_nvs(std::uint8_t addr)
+  {
+    return save_nvs_u8(NVS_KEY_I2CADDR, addr);
+  }
+
+  bool request_local_address_change(std::uint8_t address)
+  {
+    const auto status = static_cast<local_address_status_t>(_local_address_status);
+    if (status == local_address_status_t::pending
+     || _display_owner != static_cast<std::uint8_t>(display_owner_t::local_ui)
+     || _firmupdate_state != firmupdate_state_t::nothing
+     || _nvs_push
+     || address < I2C_MIN_ADDR
+     || address > I2C_MAX_ADDR
+     || address == _i2c_addr)
+    {
+      return false;
+    }
+
+    _local_address_pending = address;
+    _local_address_status = static_cast<std::uint8_t>(local_address_status_t::pending);
+    // Make READ_BUFCOUNT advertise a blocked queue while the main task commits
+    // NVS, matching the existing host CHANGE_ADDR backpressure contract.
+    _nvs_push = true;
+    return true;
+  }
+
+  local_address_status_t local_address_change_status(void)
+  {
+    return static_cast<local_address_status_t>(_local_address_status);
+  }
+
+  void acknowledge_local_address_change(void)
+  {
+    if (local_address_change_status() != local_address_status_t::pending)
+    {
+      _local_address_status = static_cast<std::uint8_t>(local_address_status_t::idle);
+    }
+  }
+
+  std::uint8_t current_i2c_address(void)
+  {
+    return _i2c_addr;
+  }
+
+  std::uint8_t local_ui_theme(void)
+  {
+    return _ui_theme;
+  }
+
+  bool save_local_ui_theme(std::uint8_t theme)
+  {
+    // Called only from the local UI (loop task) after a live theme switch;
+    // unlike the address path it needs no reboot, so a failed commit just
+    // keeps this boot's palette non-persistent.
+    if (theme > 2) return false;
+    if (!save_nvs_u8(NVS_KEY_UI_THEME, theme)) return false;
+    _ui_theme = theme;
+    return true;
+  }
+
+  bool present_local_ui_tile(std::int32_t x,
+                             std::int32_t y,
+                             std::int32_t width,
+                             std::int32_t height,
+                             const std::uint8_t* pixels)
+  {
+    if (pixels == nullptr || width <= 0 || height <= 0
+     || !_canvas_ready
+     || display_owner() != display_owner_t::local_ui)
+    {
+      return false;
+    }
+
+    const auto max_x = static_cast<std::int32_t>(board_config::LCD_WIDTH);
+    const auto max_y = static_cast<std::int32_t>(board_config::LCD_HEIGHT);
+    if (x < 0 || y < 0 || x + width > max_x || y + height > max_y)
+    {
+      return false;
+    }
+
+    // The canvas is also the source of the host READ_RAW path. M5GFX's async
+    // SPI transfer retains that source until DMA completes, so wait before the
+    // LVGL tile is converted into the canvas.
+    //
+    // LVGL's buffer is native little-endian RGB565. Passing it as uint16_t*
+    // would select M5GFX's swap565_t (big-endian byte array) interpretation
+    // and swap the bytes of every pixel, visible as a magenta/purple cast;
+    // the rgb565_t overload keeps the channel layout intact.
+    _lcd.waitDMA();
+    _canvas.pushImage(x, y, width, height,
+                      reinterpret_cast<const lgfx::rgb565_t*>(pixels));
+    mark_modified_rect(x, y, width, height);
+    return true;
+  }
+
+  void restart_after_local_address_change(void)
+  {
+    if (local_address_change_status() != local_address_status_t::saved) return;
+    i2c_slave::shutdown();
+    esp_restart();
+  }
+
+  static void service_local_address_change(void)
+  {
+    if (local_address_change_status() != local_address_status_t::pending) return;
+
+    // A host command may have been drained in the same loop turn after the UI
+    // queued its request. Host/IAP ownership wins that hand-off; do not commit
+    // an address change after the local producer has lost ownership.
+    if (_display_owner != static_cast<std::uint8_t>(display_owner_t::local_ui)
+     || _firmupdate_state != firmupdate_state_t::nothing)
+    {
+      _nvs_push = false;
+      _local_address_status = static_cast<std::uint8_t>(local_address_status_t::failed);
+      return;
+    }
+
+    const auto requested = _local_address_pending;
+    const bool saved = save_nvs(requested);
+    _nvs_push = false;
+    if (saved)
+    {
+      _i2c_addr = requested;
+      _local_address_status = static_cast<std::uint8_t>(local_address_status_t::saved);
+    }
+    else
+    {
+      _local_address_status = static_cast<std::uint8_t>(local_address_status_t::failed);
+    }
   }
 
   static void IRAM_ATTR update_argb8888(const std::uint8_t* data, std::size_t len)
@@ -377,11 +586,17 @@ namespace command_processor
 
       save_nvs(_i2c_addr);
     }
-    else  
+    else
     {
       if (ESP_OK != nvs_get_u8(handle, NVS_KEY_I2CADDR, &_i2c_addr))
       {
         ESP_LOGE(LOGNAME, "nvs error: can't get address.");
+      }
+      // A missing theme key just keeps the shipping default; only clamp
+      // out-of-range values from older or corrupted namespaces.
+      if (ESP_OK == nvs_get_u8(handle, NVS_KEY_UI_THEME, &_ui_theme) && _ui_theme > 2)
+      {
+        _ui_theme = UI_THEME_DEFAULT;
       }
       nvs_close(handle);
       _i2c_addr = std::min<std::uint8_t>(I2C_MAX_ADDR, std::max<std::uint8_t>(I2C_MIN_ADDR, _i2c_addr));
@@ -413,6 +628,11 @@ namespace command_processor
       return false;
     }
     const std::uint8_t* params = _rx_buffer[_rx_buffer_getpos];
+
+    // The queue is drained by the main task, so this transition is ordered with
+    // the LVGL frame producer. Read/configuration commands deliberately do not
+    // claim the panel: hosts may probe the Unit while the local UI is visible.
+    claim_host_display(params[0]);
 
   #if DEBUG == 1
     if (cmd_detect[params[0]] == 0)
@@ -671,6 +891,7 @@ namespace command_processor
       break;
 
     case lgfx::Panel_M5UnitLCD::CMD_UPDATE_BEGIN:
+      _display_owner = static_cast<std::uint8_t>(display_owner_t::firmware_update);
       _modified = false;
       cpu_clock::request_clock_up(cpu_clock::clock_160MHz);
       _lcd.fillScreen(TFT_WHITE);
@@ -743,7 +964,8 @@ namespace command_processor
     gfx.setCursor(0, 45);
     gfx.printf("%s", board_config::MODEL_NAME);
     gfx.setCursor(0, 90);
-    gfx.printf("FW : %u%s", static_cast<unsigned>(FIRMWARE_VERSION),
+    gfx.printf("FW : %u.%u%s", static_cast<unsigned>(FIRMWARE_MAJOR_VERSION),
+               static_cast<unsigned>(FIRMWARE_MINOR_VERSION),
                FIRMWARE_DEBUG ? " debug" : "");
   }
 
@@ -842,7 +1064,9 @@ namespace command_processor
     ESP_LOGI(LOGNAME, "LCD fillScreen complete");
     _lcd.setTextColor(TFT_BLACK, TFT_WHITE);
 
+#if !defined(CONFIG_IDF_TARGET_ESP32C61)
     drawSplash(_lcd);
+#endif
     ESP_LOGI(LOGNAME, "LCD startup text complete");
     _lcd.setColorDepth(24);
     _canvas.setColorDepth (24);
@@ -866,7 +1090,7 @@ namespace command_processor
     _canvas.setRotation(SPLASH_ROTATION);
     _canvas.fillScreen(TFT_WHITE);
     _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
-    drawSplash(_canvas);
+    // drawSplash(_canvas);
     _canvas.setRotation(0);
     _dirty_valid = false;
     _canvas_ready = true;
@@ -890,6 +1114,22 @@ namespace command_processor
              board_config::PIN_ENCODER_A,
              board_config::PIN_ENCODER_B,
              board_config::PIN_ENCODER_BUTTON);
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    const bool local_ui_init_ok = local_ui::init(_lcd,
+                                                 _i2c_addr,
+                                                 FIRMWARE_MAJOR_VERSION,
+                                                 FIRMWARE_MINOR_VERSION,
+                                                 FIRMWARE_DEBUG);
+    ESP_LOGI(LOGNAME, "Local utility UI init=%d", local_ui_init_ok);
+    if (!local_ui_init_ok)
+    {
+      // Retain the legacy information screen if the LVGL UI cannot start.
+      _lcd.setRotation(SPLASH_ROTATION);
+      drawSplash(_lcd);
+      _lcd.setRotation(0);
+    }
 #endif
 
   /*
@@ -917,8 +1157,23 @@ namespace command_processor
   //*/
   }
 
+  display_owner_t display_owner(void)
+  {
+    return static_cast<display_owner_t>(_display_owner);
+  }
+
+  bool host_owns_display(void)
+  {
+    return display_owner() == display_owner_t::host_owned;
+  }
+
+  bool firmware_update_owns_display(void)
+  {
+    return display_owner() == display_owner_t::firmware_update;
+  }
+
   /// メインループ処理 蓄積したコマンドの処理およびLCDへの出力処理
-  void IRAM_ATTR loop(void)
+  void loop(void)
   {
     ulTaskNotifyTake( pdTRUE, 0 );
     static std::uint32_t last_diagnostic_interrupts = 0;
@@ -943,11 +1198,25 @@ namespace command_processor
                static_cast<unsigned>(_last_command),
                static_cast<unsigned>(_rx_dropped_count));
     }
+    // A previous full-canvas commit may still be in flight on the C61. No
+    // producer may mutate the canvas until that DMA source is released.
+    if (_spi_bus.busy())
+    {
+      _lcd.waitDMA();
+    }
+
     bool processed_command = false;
     while (command())
     {
       processed_command = true;
     }
+    service_local_address_change();
+#if defined(CONFIG_IDF_TARGET_ESP32C61)
+    // LVGL and the local controller are owned exclusively by this Arduino task.
+    // The presenter merges tiles into the legacy canvas; the final flush below
+    // remains the only physical LCD commit for local UI frames.
+    local_ui::handle();
+#endif
     if (!processed_command && !_modified && _firmupdate_state == firmupdate_state_t::nothing)
     {
       cpu_clock::request_clock_down(

@@ -13,13 +13,18 @@ enum class model_id_t : std::uint8_t
 };
 
 static constexpr char LOGNAME[] = "M5UnitLCD";
-static constexpr std::uint8_t UNIT_LCD_DEFAULT_FIRMWARE_VERSION = 5;
-#ifndef UNIT_LCD_FIRMWARE_VERSION
-#define UNIT_LCD_FIRMWARE_VERSION UNIT_LCD_DEFAULT_FIRMWARE_VERSION
+#ifndef UNIT_LCD_FIRMWARE_MAJOR
+#define UNIT_LCD_FIRMWARE_MAJOR 1
 #endif
-static_assert(UNIT_LCD_FIRMWARE_VERSION <= 0x7F,
-              "firmware version must fit in the lower 7 bits of READ_ID byte 3");
-static constexpr std::uint8_t FIRMWARE_VERSION = UNIT_LCD_FIRMWARE_VERSION;
+#ifndef UNIT_LCD_FIRMWARE_MINOR
+#define UNIT_LCD_FIRMWARE_MINOR 1
+#endif
+static_assert(UNIT_LCD_FIRMWARE_MAJOR >= 0 && UNIT_LCD_FIRMWARE_MAJOR <= 255,
+              "firmware major version must fit in READ_ID byte 2");
+static_assert(UNIT_LCD_FIRMWARE_MINOR >= 0 && UNIT_LCD_FIRMWARE_MINOR <= 0x7F,
+              "firmware minor version must fit in READ_ID byte 3");
+static constexpr std::uint8_t FIRMWARE_MAJOR_VERSION = UNIT_LCD_FIRMWARE_MAJOR;
+static constexpr std::uint8_t FIRMWARE_MINOR_VERSION = UNIT_LCD_FIRMWARE_MINOR;
 
 #if DEBUG == 1
 static constexpr bool FIRMWARE_DEBUG = true;
@@ -27,7 +32,7 @@ static constexpr bool FIRMWARE_DEBUG = true;
 static constexpr bool FIRMWARE_DEBUG = false;
 #endif
 
-// READ_ID byte 3 keeps the shared serial version in bits 0..6 and advertises
+// READ_ID byte 2 is the major version; byte 3 keeps the minor version and advertises
 // debug builds in bit 7. Release builds therefore preserve the plain version.
-static constexpr std::uint8_t READ_ID_FIRMWARE_VERSION =
-    FIRMWARE_VERSION | (FIRMWARE_DEBUG ? 0x80 : 0x00);
+static constexpr std::uint8_t READ_ID_FIRMWARE_MINOR =
+    FIRMWARE_MINOR_VERSION | (FIRMWARE_DEBUG ? 0x80 : 0x00);

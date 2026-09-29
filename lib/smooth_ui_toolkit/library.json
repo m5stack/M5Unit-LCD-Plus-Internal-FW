@@ -1,0 +1,20 @@
+{
+  "name": "smooth_ui_toolkit",
+  "version": "2.14.0",
+  "description": "UI animation toolkit (vendored src/core subset: AnimateValue, spring/easing generators, HAL)",
+  "keywords": "ui, smooth, spring animation",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Forairaaaaa/smooth_ui_toolkit.git"
+  },
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src",
+    "flags": [
+      "-std=c++17"
+    ]
+  }
+}

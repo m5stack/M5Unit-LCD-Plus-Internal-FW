@@ -1,4 +1,7 @@
 .pio/
+.build/
+CMakeFiles/
+CMakeCache.txt
 tools/__pycache__/
 tmp/
 p4hub/

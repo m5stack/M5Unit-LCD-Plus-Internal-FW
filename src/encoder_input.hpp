@@ -8,6 +8,18 @@
 
 namespace encoder_input
 {
+  // Local UI events use a separate queue from the protocol queue. The host's
+  // PEEK/ACK cursor is never advanced when the LVGL task polls this sink.
+  // Rotation is reported once per mechanical detent (two raw quadrature edges)
+  // with delta +1/-1; the host queue keeps its original edge resolution.
+  struct local_event_t
+  {
+    std::uint8_t type = 0;
+    std::uint8_t flags = 0;
+    std::int16_t delta = 0;
+    std::int32_t position = 0;
+  };
+
   bool setup(void);
   void suspend_for_flash_write(void);
   void resume_after_flash_write(void);
@@ -32,4 +44,9 @@ namespace encoder_input
   void IRAM_ATTR set_position(std::int32_t position);
   void IRAM_ATTR read_button_config(std::uint8_t* response);
   void IRAM_ATTR set_button_config(std::uint16_t long_press_ms);
+
+  // Atomically takes one event from the local-only queue. Returns false when
+  // no event is pending. This is intended for the single LVGL owner task.
+  bool poll_local_event(local_event_t* event);
+  void clear_local_events(void);
 }
