@@ -2,6 +2,7 @@
 //! Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_timer.h>
 #include <driver/ledc.h>
 #include <nvs_flash.h>
@@ -40,6 +41,10 @@ namespace command_processor
   static const DRAM_ATTR std::uint8_t read_id_data[] = {
     0x77, 0x89, FIRMWARE_MAJOR_VERSION, READ_ID_FIRMWARE_MINOR
   };
+
+  // Initialized before the I2C ISR is armed and never modified afterwards.
+  // Keep it in internal DRAM so READ_MAC remains safe during OTA flash writes.
+  static DRAM_ATTR std::uint8_t _device_mac[unit_lcd_plus_protocol::MAC_ADDRESS_SIZE] = {};
 
   static constexpr i2c_port_t I2C_PORT = (i2c_port_t)I2C_NUM_0;
   static constexpr std::uint8_t I2C_DEFAULT_ADDR = 0x3E;
@@ -250,6 +255,8 @@ namespace command_processor
   static constexpr std::size_t TX_RESPONSE_SNAPSHOT_CAPACITY = 10;
   static_assert(sizeof(read_id_data) <= TX_RESPONSE_SNAPSHOT_CAPACITY,
                 "READ_ID response must fit in the TX snapshot");
+  static_assert(sizeof(_device_mac) <= TX_RESPONSE_SNAPSHOT_CAPACITY,
+                "READ_MAC response must fit in the TX snapshot");
 #if UNIT_LCD_HAS_ENCODER
   static_assert(unit_lcd_plus_protocol::ENCODER_STATE_SIZE <= TX_RESPONSE_SNAPSHOT_CAPACITY,
                 "encoder state response must fit in the TX snapshot");
@@ -975,6 +982,9 @@ namespace command_processor
 
     load_nvs();
 
+    // Read once in task context; no eFuse/SDK calls are made by the I2C ISR.
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(_device_mac));
+
     // UPDATE_BEGIN runs in the main task and the following UPDATE_DATA in the ISR, so building
     // the table between commands would race. Build it once at boot before the I2C interrupt is installed.
     update::initCRCtable();
@@ -1321,6 +1331,7 @@ namespace command_processor
     {
     case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
     case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
+    case unit_lcd_plus_protocol::CMD_READ_MAC:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_8:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_16:
     case lgfx::Panel_M5UnitLCD::CMD_READ_RAW_24:
@@ -1408,6 +1419,7 @@ namespace command_processor
 
       case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
       case lgfx::Panel_M5UnitLCD::CMD_READ_BUFCOUNT:
+      case unit_lcd_plus_protocol::CMD_READ_MAC:
       case lgfx::Panel_M5UnitLCD::CMD_INVOFF:
       case lgfx::Panel_M5UnitLCD::CMD_INVON:
       // RAM_FILL was missing from the classifier and became a NOP as an undefined command before reaching the executor.
@@ -1706,6 +1718,15 @@ namespace command_processor
         closeData();
         return false;
 
+      case unit_lcd_plus_protocol::CMD_READ_MAC:
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        // The original ESP32 prefetches its reply while receiving the command.
+        beginTxResponse();
+        i2c_slave::fill_txdata();
+#endif
+        closeData();
+        return false;
+
 #if UNIT_LCD_HAS_ENCODER
       case unit_lcd_plus_protocol::CMD_READ_ENCODER_STATE:
         encoder_input::read_state(_encoder_state_response);
@@ -1800,6 +1821,11 @@ namespace command_processor
     case lgfx::Panel_M5UnitLCD::CMD_READ_ID:
       _tx_response_length = sizeof(read_id_data);
       memcpy(_tx_response_snapshot, read_id_data, _tx_response_length);
+      break;
+
+    case unit_lcd_plus_protocol::CMD_READ_MAC:
+      _tx_response_length = sizeof(_device_mac);
+      memcpy(_tx_response_snapshot, _device_mac, _tx_response_length);
       break;
 
 #if UNIT_LCD_HAS_ENCODER

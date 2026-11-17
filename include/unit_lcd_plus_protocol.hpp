@@ -8,6 +8,10 @@
 
 namespace unit_lcd_plus_protocol
 {
+  // Factory-programmed MAC-48 in normal display order (first octet first).
+  static constexpr std::uint8_t CMD_READ_MAC = 0x0A;
+  static constexpr std::size_t MAC_ADDRESS_SIZE = 6;
+
   static constexpr std::uint8_t CMD_READ_ENCODER_STATE = 0xB0;
   static constexpr std::uint8_t CMD_PEEK_ENCODER_EVENT = 0xB1;
   static constexpr std::uint8_t CMD_ACK_ENCODER_EVENT = 0xB2;

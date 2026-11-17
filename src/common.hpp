@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-/// The MODEL_ID table in docs/Unit_LCD_Plus_I2C_Protocol_zh.md section 6.1 is authoritative; each enumerator maps 1:1 to that value.
+/// Legacy model IDs; READ_ID now reports firmware major/minor instead.
 enum class model_id_t : std::uint8_t
 {
   unit_lcd = 0,
@@ -17,7 +17,7 @@ static constexpr char LOGNAME[] = "M5UnitLCD";
 #define UNIT_LCD_FIRMWARE_MAJOR 1
 #endif
 #ifndef UNIT_LCD_FIRMWARE_MINOR
-#define UNIT_LCD_FIRMWARE_MINOR 1
+#define UNIT_LCD_FIRMWARE_MINOR 2
 #endif
 static_assert(UNIT_LCD_FIRMWARE_MAJOR >= 0 && UNIT_LCD_FIRMWARE_MAJOR <= 255,
               "firmware major version must fit in READ_ID byte 2");

@@ -5,13 +5,16 @@
 
 ## Firmware versions
 
-Unit LCD (ESP32) and Unit LCD Plus (ESP32-C61) use the same serial versions.
+Unit LCD (ESP32) and Unit LCD Plus (ESP32-C61) use the same major/minor firmware versions.
+`READ_ID` returns `77 89 major (minor | debug_flag)`; Byte 2 is not a model ID.
+Version 1.2 adds `READ_MAC (0x0A)`, which returns six factory eFuse MAC bytes.
+See the root README and `examples/ReadMac/ReadMac.ino` for current usage.
 
 | Build | Firmware version |
 |:--|:--|
-| `release` / `esp32_release` | 5 |
-| `iap_test` / `esp32_iap_test` | 6 |
-| `debug` / `esp32_debug` | 5, with `READ_ID` debug bit set (`0x85`) |
+| `release` / `esp32_release` | 1.2 |
+| `iap_test` / `esp32_iap_test` | 1.3 |
+| `debug` / `esp32_debug` | 1.2, with `READ_ID` debug bit set (`0x82`) |
 
 ## How to update
 
@@ -48,9 +51,9 @@ After it is successful, please remove the Unit.
 
 ## About Communication with Unit LCD
 
-Unit LCD Plus (`READ_ID` byte 2 `MODEL_ID` = 1) also provides encoder and
-button commands `0xB0` through `0xB5`. Detect the product with `MODEL_ID`,
-not with the firmware version. They expose a current-state snapshot, a 64-entry event queue
+Unit LCD Plus also provides encoder and button commands `0xB0` through `0xB5`.
+The host must already know the connected product; `READ_ID` does not report
+a model ID. These commands expose a current-state snapshot, a 64-entry event queue
 with explicit sequence acknowledgement, press/release/single-click/double-click/
 long-press events, and a configurable 500..5000 ms long-press threshold. See
 [`docs/encoder_protocol.md`](../docs/encoder_protocol.md) for the byte layouts,
@@ -126,7 +129,8 @@ flags, event types, overflow behavior, and timing.
 ## Command list (readable commands)
 | hex|len|   command   | description                          | return values    |
 |:--:|:-:|:------------|:-------------------------------------|:-----------------|
-|0x04| 1 |READ_ID      |ID, model and firmware version.<br>4Byte received|[0] 0x77<br>[1] 0x89<br>[2] MODEL_ID (0=Unit LCD, 1=Unit LCD Plus)<br>[3] Firmware version (shared serial number)|
+|0x04| 1 |READ_ID      |ID and firmware version.<br>4Byte received|[0] 0x77<br>[1] 0x89<br>[2] Major version<br>[3] Minor version, bit 7 = debug|
+|0x0A| 1 |READ_MAC     |Factory eFuse MAC, available from firmware 1.2|[0-5] MAC-48, first octet first; read exactly 6 bytes|
 |0x09| 1 |READ_BUFCOUNT|Get remaining command buffer.<br>The higher the value, the more room there is.<br>Can be read out continuously.|[0] remaining command buffer (0~255)<br>Repeated reception is possible.|
 |0x81| 1 |READ_RAW_8   |Readout of RGB332 image               |[0]   RGB332<br>Repeat [0] until communication STOP.|
 |0x82| 1 |READ_RAW_16  |Readout of RGB565 image               |[0-1] RGB565<br>Repeat [0-1] until communication STOP.|

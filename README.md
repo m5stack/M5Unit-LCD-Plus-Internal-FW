@@ -1,6 +1,6 @@
 # Unit LCD Plus Internal Firmware
 
-Arduino/PlatformIO firmware for M5Stack Unit LCD Plus with ESP32-C61.
+Arduino/PlatformIO firmware for M5Stack Unit LCD Plus (U242) with ESP32-C61.
 
 This project is adapted from
 [`M5Unit-LCD-Internal-FW`](https://github.com/m5stack/M5Unit-LCD-Internal-FW)
@@ -14,9 +14,9 @@ PlatformIO environments:
 
 | Environment | Purpose |
 | --- | --- |
-| `release`, `esp32_release` | Production internal firmware, version 1.1 |
-| `iap_test`, `esp32_iap_test` | Temporary version 1.2 image for online-update validation |
-| `debug`, `esp32_debug` | Debug build of version 1.1 (`READ_ID` minor byte reports `0x81`) |
+| `release`, `esp32_release` | Production internal firmware, version 1.2 |
+| `iap_test`, `esp32_iap_test` | Temporary version 1.3 image for online-update validation |
+| `debug`, `esp32_debug` | Debug build of version 1.2 (`READ_ID` minor byte reports `0x82`) |
 
 ```bash
 pio run -e release
@@ -54,10 +54,17 @@ interface is RGB666 even though the internal API color depth is named 24-bit.
 External controllers can continue to use the RGB332, RGB565, and RGB888
 protocol commands.
 
-## Firmware version 1.1
+## Firmware version 1.2
 
-Current release uses major version 1 and minor version 1. READ_ID returns
-`77 89 01 01`; byte 2 is the major version, not MODEL_ID. Byte 3 contains
+Current release uses major version 1 and minor version 2. READ_ID returns
+`77 89 01 02`; byte 2 is the major version, not MODEL_ID. Byte 3 contains
 the minor version (with bit 7 retained for debug builds). Boot and Device Info
-read these same version values. IAP test builds use 1.2. Older serial-version
+read these same version values. IAP test builds use 1.3. Older serial-version
 5/6 and model-based updater documentation describes the previous protocol.
+
+Version 1.2 adds `READ_MAC (0x0A)`: write the one-byte command, then read
+six factory-programmed eFuse MAC bytes in normal display order. Both
+STOP-separated and repeated-START reads are supported. The command does not
+start Wi-Fi, change the display owner, or enter the drawing queue. Hosts must
+use the known product/firmware version to determine support; older firmware
+treats `0x0A` as undefined. See `examples/ReadMac/ReadMac.ino` for a host example.
