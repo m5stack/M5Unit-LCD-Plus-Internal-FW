@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | 1.3 |
+| 文档版本 | 1.4 |
 | 适用产品 | Unit LCD Plus（ESP32-C61） |
 | 适用正式固件版本 | 1.2 |
 | 默认 7 位 I2C 地址 | `0x3E` |
@@ -242,11 +242,11 @@ ARGB8888 和 A8 的 Alpha 定义：`0x00` 为完全透明，`0xFF` 为完全不�
 Byte 0      0x77
 Byte 1      0x89
 Byte 2      firmware_major
-Byte 3      debug_flag | firmware_minor
+Byte 3      firmware_minor
 ```
 
-Byte 3 的 bit 7 是 debug 标志，bits 6..0 是 minor 版本。当前 release 1.2 返回
-`77 89 01 02`，debug 1.2 返回 `77 89 01 82`，IAP 测试固件 1.3 返回 `77 89 01 03`。
+Byte 2 和 Byte 3 分别是完整的主版本号和次版本号，不包含构建类型或调试标志。
+当前正式固件 1.2 返回 `77 89 01 02`，IAP 测试固件 1.3 返回 `77 89 01 03`。
 Byte 2 是 major 版本，不是 `MODEL_ID`。旧文档中的 MODEL_ID/连续版本 5、6 是历史格式。
 已发布的 `Panel_M5UnitLCD` 只校验前两个字节，因此响应仍保持原来的 4 字节长度。
 
@@ -804,7 +804,7 @@ IAP 不改变持久化 I2C 地址。通信中断、CRC 错误或超时后，应�
 
 - 本分支 ESP32 和 ESP32-C61 构建使用 major/minor 版本：release 为 1.2，IAP 测试固件为 1.3。
 - 显示、读回、地址、复位和 IAP 命令编号保持不变，`READ_ID` 仍为 4 字节。
-- `READ_ID` Byte 2 为 major；Byte 3 的 bit 7 为 debug 标志，bits 6..0 为 minor。
+- `READ_ID` Byte 2 为 major，Byte 3 为完整的 minor；主机应直接读取这两个字节，无需位掩码。
   历史文档中的 MODEL_ID 和连续版本号 5、6 不适用于当前固件。
 - `0xB0..0xB5` 是 Unit LCD Plus 的编码器/按键命令；机型须由主机产品配置确认。
 - `0x0A READ_MAC` 从 1.2 起支持；旧主机不发送该指令时行为不变。
@@ -836,3 +836,4 @@ IAP 不改变持久化 I2C 地址。通信中断、CRC 错误或超时后，应�
 | 1.1 | 2026-08-20 | 将 `READ_ID` Byte 2 定义为 `MODEL_ID`，Byte 3 定义为连续固件版本号 |
 | 1.2 | 2026-09-08 | 编码器按键改为 GPIO9；上电按住可进入 Joint Download Boot |
 | 1.3 | 2026-11-17 | 新增 `0x0A READ_MAC`；固件升至 1.2；同步当前 READ_ID major/minor 定义 |
+| 1.4 | 2026-11-18 | 删除版本响应的调试标志及 debug 构建环境；正式版保持 1.2，版本字节直接表示主/次版本号 |

@@ -566,7 +566,7 @@ namespace i2c_slave
     std::uint32_t available = 0;
     i2c_ll_get_txfifo_len(device, &available);
     // Also called from the status-read address match during an OTA flash write. Keep this
-    // path to IRAM functions and DRAM data only, so debug builds do not out-line std::min
+    // path to IRAM functions and DRAM data only, so the compiler cannot out-line std::min
     // or ordinary inline helpers into flash.
     const std::size_t capacity = available < TX_STAGING_CAPACITY
                                ? available

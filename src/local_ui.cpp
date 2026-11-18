@@ -167,8 +167,7 @@ namespace local_ui
   bool init(LGFX_Device& lcd,
             std::uint8_t address,
             std::uint8_t firmware_major,
-            std::uint8_t firmware_minor,
-            bool debug_build)
+            std::uint8_t firmware_minor)
   {
     if (active) return true;
 
@@ -191,7 +190,6 @@ namespace local_ui
     info.address = address;
     info.firmware_major = firmware_major;
     info.firmware_minor = firmware_minor;
-    info.debug_build = debug_build;
 
     unit_lcd_ui::callbacks_t callbacks;
     callbacks.request_address_change = address_change_requested;

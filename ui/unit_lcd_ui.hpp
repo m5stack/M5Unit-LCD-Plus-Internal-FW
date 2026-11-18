@@ -44,7 +44,6 @@ namespace unit_lcd_ui
     std::uint8_t address = 0x3E;
     std::uint8_t firmware_major = 1;
     std::uint8_t firmware_minor = 1;
-    bool debug_build = false;
   };
 
   struct callbacks_t

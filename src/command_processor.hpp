@@ -3,7 +3,6 @@
 
 #pragma once
 
-// #define DEBUG 1
 #pragma GCC optimize ("O3")
 
 #include <cstddef>

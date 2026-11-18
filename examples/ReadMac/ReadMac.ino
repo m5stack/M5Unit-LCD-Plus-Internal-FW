@@ -38,13 +38,13 @@ void setup()
   uint8_t id[4] = {};
   const bool supported = readBytes(0x04, id, sizeof(id), true)
                       && id[0] == 0x77 && id[1] == 0x89
-                      && id[2] == 1 && (id[3] & 0x7F) >= 2;
+                      && id[2] == 1 && id[3] >= 2;
   if (!supported)
   {
     Serial.println("Unit LCD Plus firmware 1.2 or later is required.");
     while (true) delay(1000);
   }
-  Serial.printf("Unit LCD Plus firmware %u.%u\n", id[2], id[3] & 0x7F);
+  Serial.printf("Unit LCD Plus firmware %u.%u\n", id[2], id[3]);
 }
 
 void loop()

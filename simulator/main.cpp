@@ -371,7 +371,6 @@ int main(int argc, char** argv)
   unit_lcd_ui::device_info_t info;
   info.address = 0x3E;
   info.firmware_minor = options.firmware_version;
-  info.debug_build = false;
   unit_lcd_ui::callbacks_t callbacks;
   callbacks.request_address_change = address_change_requested;
   callbacks.theme_changed = theme_changed;

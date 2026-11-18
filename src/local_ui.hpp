@@ -12,8 +12,7 @@ namespace local_ui
   bool init(LGFX_Device& lcd,
             std::uint8_t address,
             std::uint8_t firmware_major,
-            std::uint8_t firmware_minor,
-            bool debug_build);
+            std::uint8_t firmware_minor);
 
   void handle(void);
   void deinit(void);

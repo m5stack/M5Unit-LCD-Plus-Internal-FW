@@ -16,7 +16,6 @@ PlatformIO environments:
 | --- | --- |
 | `release`, `esp32_release` | Production internal firmware, version 1.2 |
 | `iap_test`, `esp32_iap_test` | Temporary version 1.3 image for online-update validation |
-| `debug`, `esp32_debug` | Debug build of version 1.2 (`READ_ID` minor byte reports `0x82`) |
 
 ```bash
 pio run -e release
@@ -58,7 +57,7 @@ protocol commands.
 
 Current release uses major version 1 and minor version 2. READ_ID returns
 `77 89 01 02`; byte 2 is the major version, not MODEL_ID. Byte 3 contains
-the minor version (with bit 7 retained for debug builds). Boot and Device Info
+the plain minor version without build flags. Boot and Device Info
 read these same version values. IAP test builds use 1.3. Older serial-version
 5/6 and model-based updater documentation describes the previous protocol.
 

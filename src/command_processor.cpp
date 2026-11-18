@@ -39,7 +39,7 @@ namespace command_processor
   /// Kept in DRAM because the IRAM-resident I2C ISR reads it. Left in flash rodata, a READ_ID
   /// arriving during an OTA flash write (cache disabled) would panic.
   static const DRAM_ATTR std::uint8_t read_id_data[] = {
-    0x77, 0x89, FIRMWARE_MAJOR_VERSION, READ_ID_FIRMWARE_MINOR
+    0x77, 0x89, FIRMWARE_MAJOR_VERSION, FIRMWARE_MINOR_VERSION
   };
 
   // Initialized before the I2C ISR is armed and never modified afterwards.
@@ -381,17 +381,11 @@ namespace command_processor
   std::uint_fast16_t _read_yptr = 0;
 
 
-  #if DEBUG == 1
-  std::uint8_t cmd_detect[256] = {0};
-  #endif
 
   /// Saves one key to NVS. Returns true only if open / set / commit all succeed.
   static bool IRAM_ATTR save_nvs_u8(const char* key, std::uint8_t value)
   {
     i2c_slave::stop_isr();
-// #if DEBUG == 1
-// lgfx::gpio_hi(0);
-// #endif
 
     bool result = false;
     {
@@ -411,9 +405,6 @@ namespace command_processor
     }
     i2c_slave::start_isr();
 
-// #if DEBUG == 1
-// lgfx::gpio_lo(0);
-// #endif
     return result;
   }
 
@@ -641,13 +632,6 @@ namespace command_processor
     // claim the panel: hosts may probe the Unit while the local UI is visible.
     claim_host_display(params[0]);
 
-  #if DEBUG == 1
-    if (cmd_detect[params[0]] == 0)
-    {
-      cmd_detect[params[0]] = 1;
-      ESP_LOGI(LOGNAME, "CMD:%02x", params[0]);
-    }
-  #endif
 
     switch (params[0])
     {
@@ -971,9 +955,8 @@ namespace command_processor
     gfx.setCursor(0, 45);
     gfx.printf("%s", board_config::MODEL_NAME);
     gfx.setCursor(0, 90);
-    gfx.printf("FW : %u.%u%s", static_cast<unsigned>(FIRMWARE_MAJOR_VERSION),
-               static_cast<unsigned>(FIRMWARE_MINOR_VERSION),
-               FIRMWARE_DEBUG ? " debug" : "");
+    gfx.printf("FW : %u.%u", static_cast<unsigned>(FIRMWARE_MAJOR_VERSION),
+               static_cast<unsigned>(FIRMWARE_MINOR_VERSION));
   }
 
   void setup(void)
@@ -1027,10 +1010,6 @@ namespace command_processor
 #endif
 
 
-#if DEBUG == 1
-    lgfx::pinMode(0, lgfx::pin_mode_t::output);
-    lgfx::gpio_hi(0);
-#endif
 
     {
       auto cfg = _spi_bus.config();
@@ -1130,8 +1109,7 @@ namespace command_processor
     const bool local_ui_init_ok = local_ui::init(_lcd,
                                                  _i2c_addr,
                                                  FIRMWARE_MAJOR_VERSION,
-                                                 FIRMWARE_MINOR_VERSION,
-                                                 FIRMWARE_DEBUG);
+                                                 FIRMWARE_MINOR_VERSION);
     ESP_LOGI(LOGNAME, "Local utility UI init=%d", local_ui_init_ok);
     if (!local_ui_init_ok)
     {

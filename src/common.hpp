@@ -21,18 +21,9 @@ static constexpr char LOGNAME[] = "M5UnitLCD";
 #endif
 static_assert(UNIT_LCD_FIRMWARE_MAJOR >= 0 && UNIT_LCD_FIRMWARE_MAJOR <= 255,
               "firmware major version must fit in READ_ID byte 2");
-static_assert(UNIT_LCD_FIRMWARE_MINOR >= 0 && UNIT_LCD_FIRMWARE_MINOR <= 0x7F,
+static_assert(UNIT_LCD_FIRMWARE_MINOR >= 0 && UNIT_LCD_FIRMWARE_MINOR <= 255,
               "firmware minor version must fit in READ_ID byte 3");
 static constexpr std::uint8_t FIRMWARE_MAJOR_VERSION = UNIT_LCD_FIRMWARE_MAJOR;
 static constexpr std::uint8_t FIRMWARE_MINOR_VERSION = UNIT_LCD_FIRMWARE_MINOR;
 
-#if DEBUG == 1
-static constexpr bool FIRMWARE_DEBUG = true;
-#else
-static constexpr bool FIRMWARE_DEBUG = false;
-#endif
-
-// READ_ID byte 2 is the major version; byte 3 keeps the minor version and advertises
-// debug builds in bit 7. Release builds therefore preserve the plain version.
-static constexpr std::uint8_t READ_ID_FIRMWARE_MINOR =
-    FIRMWARE_MINOR_VERSION | (FIRMWARE_DEBUG ? 0x80 : 0x00);
+// READ_ID returns the plain major and minor bytes, with no build flags.

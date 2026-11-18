@@ -6,7 +6,7 @@ Boot restores the original M5STACK logo (100x100, centered on white) for 1000ms,
 then enters Home without a page translation. Current I2C address appears above the
 logo, with the firmware version below; both use the same live input as Home/Device.
 The release uses FIRMWARE_MAJOR_VERSION and FIRMWARE_MINOR_VERSION from
-src/common.hpp (currently 1.1), also used by READ_ID; UI formats both as V1.1. It uses an LVGL RGB565 image in Flash,
+src/common.hpp (currently 1.2), also used by READ_ID; UI formats both as V1.2. It uses an LVGL RGB565 image in Flash,
 converted from the original MIT-licensed src/logo.hpp artwork. The UI timer drives
 the transition without delaying I2C processing; host ownership may preempt the logo.
 Inputs received during the logo are ignored and cannot activate a menu on release.
